@@ -1,4 +1,5 @@
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+const HTTP_BASE = "/api";
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -28,7 +29,7 @@ export async function apiFetch<T = unknown>(
     }
   }
 
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await fetch(`${HTTP_BASE}${path}`, {
     ...rest,
     headers: mergedHeaders,
   });
@@ -41,14 +42,13 @@ export async function apiFetch<T = unknown>(
         errorMessage = errorBody.error;
       }
     } catch {
-      // ignore parse errors
+      // ignore JSON parse errors on error responses
     }
     const err = new Error(errorMessage) as Error & { status: number };
     err.status = res.status;
     throw err;
   }
 
-  // Handle 202/204 with no body
   const contentType = res.headers.get("content-type");
   if (
     res.status === 204 ||
@@ -61,7 +61,6 @@ export async function apiFetch<T = unknown>(
   return res.json() as Promise<T>;
 }
 
-// --- Auth ---
 export interface User {
   id: string;
   pseudo: string;
@@ -103,7 +102,6 @@ export function login(payload: LoginPayload) {
   });
 }
 
-// --- Pool ---
 export interface JoinPoolResponse {
   message?: string;
   room_id?: string;
@@ -122,7 +120,6 @@ export function leavePool() {
   });
 }
 
-// --- Rooms ---
 export interface Room {
   id: string;
   country_a: string;
@@ -147,7 +144,6 @@ export function getRoomMessages(roomId: string) {
   return apiFetch<Message[]>(`/rooms/${roomId}/messages`);
 }
 
-// --- WebSocket ---
 export function createChatWebSocket(roomId: string): WebSocket {
   const token = getToken();
   const wsBase = BASE_URL.replace(/^http/, "ws");
