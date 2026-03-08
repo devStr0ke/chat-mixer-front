@@ -31,6 +31,7 @@ export default function ChatPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const reconnectCountRef = useRef(0);
+  const localIdRef = useRef(0);
   const MAX_RECONNECTS = 10;
   const RECONNECT_DELAY = 2000;
 
@@ -83,12 +84,14 @@ export default function ChatPage() {
 
       ws.addEventListener("message", (e) => {
         if (cancelled) return;
-        try {
-          const incoming: Message = JSON.parse(e.data);
-          setMessages((prev) => [...prev, incoming]);
-        } catch {
-          // ignore non-JSON frames
-        }
+        localIdRef.current += 1;
+        const incoming: Message = {
+          id: `remote-${localIdRef.current}`,
+          sender_id: "partner",
+          content: String(e.data),
+          sent_at: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, incoming]);
       });
 
       ws.addEventListener("close", (e) => {
@@ -153,8 +156,16 @@ export default function ChatPage() {
   function handleSend(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const text = input.trim();
-    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !user) return;
     wsRef.current.send(text);
+    localIdRef.current += 1;
+    const localMsg: Message = {
+      id: `local-${localIdRef.current}`,
+      sender_id: user.id,
+      content: text,
+      sent_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, localMsg]);
     setInput("");
     inputRef.current?.focus();
   }
