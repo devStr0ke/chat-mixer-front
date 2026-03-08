@@ -149,6 +149,7 @@ export function getRoomMessages(roomId: string) {
 
 export function createChatWebSocket(roomId: string): WebSocket {
   const token = getToken();
-  const wsBase = BASE_URL.replace(/^http/, "ws");
-  return new WebSocket(`${wsBase}/ws/${roomId}?token=${token ?? ""}`);
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const wsHost = process.env.NEXT_PUBLIC_WS_HOST ?? BASE_URL.replace(/^https?:\/\//, "");
+  return new WebSocket(`${protocol}://${wsHost}/ws/${roomId}?token=${token ?? ""}`);
 }
