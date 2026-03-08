@@ -9,6 +9,15 @@ interface AuthState {
   hydrate: () => void;
 }
 
+function isTokenExpired(token: string): boolean {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    return typeof payload.exp === "number" && payload.exp * 1000 < Date.now();
+  } catch {
+    return true;
+  }
+}
+
 export const useAuthStore = create<AuthState>()((set) => ({
   token: null,
   user: null,
@@ -17,7 +26,6 @@ export const useAuthStore = create<AuthState>()((set) => ({
     if (typeof window !== "undefined") {
       localStorage.setItem("token", token);
       localStorage.setItem("user", JSON.stringify(user));
-      // Also set a cookie so the Edge middleware can read it
       document.cookie = `token=${token}; path=/; max-age=${60 * 60 * 72}; SameSite=Lax`;
     }
     set({ token, user });
@@ -36,16 +44,20 @@ export const useAuthStore = create<AuthState>()((set) => ({
     if (typeof window === "undefined") return;
     const token = localStorage.getItem("token");
     const userRaw = localStorage.getItem("user");
-    if (token && userRaw) {
-      try {
-        const user = JSON.parse(userRaw) as User;
-        // Re-sync the cookie in case it expired while localStorage didn't
-        document.cookie = `token=${token}; path=/; max-age=${60 * 60 * 72}; SameSite=Lax`;
-        set({ token, user });
-      } catch {
-        localStorage.removeItem("token");
-        localStorage.removeItem("user");
-      }
+    if (!token || !userRaw) return;
+    if (isTokenExpired(token)) {
+      localStorage.removeItem("token");
+      localStorage.removeItem("user");
+      document.cookie = "token=; path=/; max-age=0; SameSite=Lax";
+      return;
+    }
+    try {
+      const user = JSON.parse(userRaw) as User;
+      document.cookie = `token=${token}; path=/; max-age=${60 * 60 * 72}; SameSite=Lax`;
+      set({ token, user });
+    } catch {
+      localStorage.removeItem("token");
+      localStorage.removeItem("user");
     }
   },
 }));

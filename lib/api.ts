@@ -50,12 +50,11 @@ export async function apiFetch<T = unknown>(
   }
 
   const contentType = res.headers.get("content-type");
-  if (
-    res.status === 204 ||
-    !contentType ||
-    !contentType.includes("application/json")
-  ) {
+  if (res.status === 204) {
     return {} as T;
+  }
+  if (!contentType || !contentType.includes("application/json")) {
+    throw new Error("Unexpected response from server.");
   }
 
   return res.json() as Promise<T>;
@@ -82,7 +81,7 @@ export interface RegisterPayload {
 }
 
 export interface LoginPayload {
-  email: string;
+  identifier: string;
   password: string;
 }
 

@@ -6,7 +6,7 @@ export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   if (
-    PUBLIC_PATHS.some((p) => pathname.startsWith(p)) ||
+    pathname.startsWith("/api") ||
     pathname.startsWith("/_next") ||
     pathname.startsWith("/favicon")
   ) {
@@ -14,6 +14,14 @@ export function proxy(request: NextRequest) {
   }
 
   const token = request.cookies.get("token")?.value;
+  const isPublic = PUBLIC_PATHS.some((p) => pathname.startsWith(p));
+
+  if (isPublic) {
+    if (token) {
+      return NextResponse.redirect(new URL("/pool", request.url));
+    }
+    return NextResponse.next();
+  }
 
   if (!token) {
     return NextResponse.redirect(new URL("/login", request.url));

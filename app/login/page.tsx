@@ -10,7 +10,7 @@ export default function LoginPage() {
   const router = useRouter();
   const setAuth = useAuthStore((s) => s.setAuth);
 
-  const [email, setEmail] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -20,7 +20,7 @@ export default function LoginPage() {
     setError(null);
     setLoading(true);
     try {
-      const data = await login({ email, password });
+      const data = await login({ identifier, password });
       setAuth(data.token, data.user);
       router.push("/pool");
     } catch (err) {
@@ -56,15 +56,15 @@ export default function LoginPage() {
 
           <div className="space-y-1.5">
             <label className="block text-sm font-medium text-neutral-300">
-              Email
+              Email or Pseudo
             </label>
             <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              type="text"
+              value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)}
               required
-              placeholder="you@example.com"
-              autoComplete="email"
+              placeholder="you@example.com or shadow_fox"
+              autoComplete="username"
               className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-4 py-2.5 text-sm text-white placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition"
             />
           </div>
