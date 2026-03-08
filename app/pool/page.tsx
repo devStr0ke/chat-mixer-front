@@ -1,33 +1,244 @@
 "use client";
 
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import { joinPool, leavePool } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
+import { flagUrl } from "@/lib/countries";
+
+type PoolState = "idle" | "searching" | "matched";
+
+const POLL_INTERVAL = 4000;
 
 export default function PoolPage() {
   const router = useRouter();
   const user = useAuthStore((s) => s.user);
   const clearAuth = useAuthStore((s) => s.clearAuth);
 
-  function handleLogout() {
+  const [state, setState] = useState<PoolState>("idle");
+  const [sameCountry, setSameCountry] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+
+  const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeRef = useRef(false);
+  const startTimeRef = useRef<number>(0);
+
+  const stopPolling = useCallback(() => {
+    activeRef.current = false;
+    if (pollingRef.current) {
+      clearTimeout(pollingRef.current);
+      pollingRef.current = null;
+    }
+  }, []);
+
+  const poll = useCallback(async () => {
+    if (!activeRef.current) return;
+    try {
+      try { await leavePool(); } catch { /* not in pool */ }
+      const data = await joinPool(sameCountry);
+      if (!activeRef.current) return;
+      if (data.room_id) {
+        stopPolling();
+        setState("matched");
+        router.push(`/chat/${data.room_id}`);
+        return;
+      }
+      pollingRef.current = setTimeout(poll, POLL_INTERVAL);
+    } catch (err) {
+      if (!activeRef.current) return;
+      stopPolling();
+      setState("idle");
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    }
+  }, [sameCountry, router, stopPolling]);
+
+  const handleSearch = useCallback(async () => {
+    setError(null);
+    setState("searching");
+    setElapsed(0);
+    startTimeRef.current = Date.now();
+    activeRef.current = true;
+    try {
+      const data = await joinPool(sameCountry);
+      if (!activeRef.current) return;
+      if (data.room_id) {
+        stopPolling();
+        setState("matched");
+        router.push(`/chat/${data.room_id}`);
+        return;
+      }
+      pollingRef.current = setTimeout(poll, POLL_INTERVAL);
+    } catch (err) {
+      if (!activeRef.current) return;
+      stopPolling();
+      setState("idle");
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    }
+  }, [sameCountry, router, poll, stopPolling]);
+
+  const handleCancel = useCallback(async () => {
+    stopPolling();
+    setState("idle");
+    setElapsed(0);
+    try { await leavePool(); } catch { /* ignore */ }
+  }, [stopPolling]);
+
+  useEffect(() => {
+    if (state !== "searching") return;
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [state]);
+
+  useEffect(() => {
+    return () => stopPolling();
+  }, [stopPolling]);
+
+  async function handleLogout() {
+    stopPolling();
+    try { await leavePool(); } catch { /* not in pool, ignore */ }
     clearAuth();
     router.push("/login");
   }
 
+  function formatElapsed(s: number): string {
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${m}:${String(sec).padStart(2, "0")}`;
+  }
+
   return (
-    <div className="min-h-screen flex items-center justify-center bg-neutral-950">
-      <div className="text-center space-y-4">
-        <p className="text-white text-xl font-medium">
-          Hello{" "}
-          <span className="text-violet-400 font-semibold">{user?.pseudo}</span>
-          , welcome back.
-        </p>
-        <button
-          onClick={handleLogout}
-          className="text-sm text-neutral-500 hover:text-neutral-300 transition"
-        >
-          Log out
-        </button>
-      </div>
+    <div className="min-h-screen bg-neutral-950 flex flex-col">
+      <header className="flex items-center justify-between px-6 py-4 border-b border-neutral-800">
+        <span className="text-lg font-bold text-white">
+          Chat<span className="text-violet-500">Mixer</span>
+        </span>
+        <div className="flex items-center gap-3">
+          {user && (
+            <span className="flex items-center gap-2 text-sm text-neutral-400">
+              <img
+                src={flagUrl(user.country)}
+                alt={user.country}
+                width={20}
+                height={15}
+                className="rounded-sm object-cover"
+              />
+              <span className="text-neutral-300 font-medium">{user.pseudo}</span>
+            </span>
+          )}
+          <button
+            onClick={handleLogout}
+            className="text-xs text-neutral-500 hover:text-neutral-300 transition"
+          >
+            Log out
+          </button>
+        </div>
+      </header>
+
+      <main className="flex-1 flex flex-col items-center justify-center px-4 gap-8">
+        {state === "idle" && (
+          <div className="text-center space-y-6 w-full max-w-xs">
+            <div className="space-y-2">
+              <h2 className="text-2xl font-bold text-white">Find a stranger</h2>
+              <p className="text-sm text-neutral-400">
+                Get matched with a random anonymous user for a 24h chat.
+              </p>
+            </div>
+
+            {error && (
+              <div className="rounded-lg bg-red-900/40 border border-red-700 px-4 py-3 text-sm text-red-300 text-left">
+                {error}
+              </div>
+            )}
+
+            <label className="flex items-center justify-between bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-3 cursor-pointer group">
+              <div>
+                <p className="text-sm font-medium text-neutral-200 group-hover:text-white transition">
+                  Same country only
+                </p>
+                <p className="text-xs text-neutral-500 flex items-center gap-1">
+                  Match with someone from{" "}
+                  {user ? (
+                    <img
+                      src={flagUrl(user.country)}
+                      alt={user.country}
+                      width={16}
+                      height={12}
+                      className="rounded-sm object-cover inline"
+                    />
+                  ) : (
+                    "your country"
+                  )}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={sameCountry}
+                onClick={() => setSameCountry((v) => !v)}
+                className={`relative w-11 h-6 rounded-full transition-colors ${
+                  sameCountry ? "bg-violet-600" : "bg-neutral-700"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                    sameCountry ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </label>
+
+            <button
+              onClick={handleSearch}
+              className="w-full bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl py-3 text-base transition focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-2 focus:ring-offset-neutral-950 shadow-lg shadow-violet-900/30"
+            >
+              Find a match
+            </button>
+          </div>
+        )}
+
+        {state === "searching" && (
+          <div className="text-center space-y-8">
+            <div className="relative flex items-center justify-center">
+              <span className="absolute w-28 h-28 rounded-full bg-violet-600/20 animate-ping" />
+              <span className="absolute w-20 h-20 rounded-full bg-violet-600/30 animate-ping [animation-delay:150ms]" />
+              <span className="relative w-16 h-16 rounded-full bg-violet-600 flex items-center justify-center shadow-lg shadow-violet-800/50">
+                <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+              </span>
+            </div>
+
+            <div className="space-y-1">
+              <p className="text-lg font-semibold text-white">
+                Searching for a match…
+              </p>
+              <p className="text-sm text-neutral-400">
+                {sameCountry ? "Looking for someone in your country" : "Looking worldwide"}
+              </p>
+              <p className="text-xs text-neutral-500 font-mono mt-2">
+                {formatElapsed(elapsed)}
+              </p>
+            </div>
+
+            <button
+              onClick={handleCancel}
+              className="px-6 py-2.5 text-sm font-medium text-neutral-300 hover:text-white border border-neutral-700 hover:border-neutral-500 rounded-xl transition"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {state === "matched" && (
+          <div className="text-center space-y-4">
+            <p className="text-lg font-semibold text-white">Match found!</p>
+            <p className="text-sm text-neutral-400">Redirecting to chat…</p>
+          </div>
+        )}
+      </main>
     </div>
   );
 }

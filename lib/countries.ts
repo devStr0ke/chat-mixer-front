@@ -3,6 +3,15 @@ export interface Country {
   name: string;
 }
 
+export function flagUrl(code: string): string {
+  if (!code || code.length !== 2) return "";
+  return `https://flagcdn.com/w40/${code.toLowerCase()}.png`;
+}
+
+export function countryName(code: string): string {
+  return COUNTRIES.find((c) => c.code === code)?.name ?? code;
+}
+
 export const COUNTRIES: Country[] = [
   { code: "AF", name: "Afghanistan" },
   { code: "AL", name: "Albania" },
@@ -196,20 +205,3 @@ export const COUNTRIES: Country[] = [
   { code: "ZM", name: "Zambia" },
   { code: "ZW", name: "Zimbabwe" },
 ];
-
-/**
- * Converts an ISO 3166-1 alpha-2 country code to an emoji flag.
- * Works by converting each letter to its regional indicator symbol.
- */
-export function countryCodeToFlag(code: string): string {
-  if (!code || code.length !== 2) return "🌐";
-  return code
-    .toUpperCase()
-    .split("")
-    .map((c) => String.fromCodePoint(0x1f1e0 + c.charCodeAt(0) - 65))
-    .join("");
-}
-
-export function countryName(code: string): string {
-  return COUNTRIES.find((c) => c.code === code)?.name ?? code;
-}

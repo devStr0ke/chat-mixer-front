@@ -1,11 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { register } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
-import { COUNTRIES } from "@/lib/countries";
+import { COUNTRIES, flagUrl } from "@/lib/countries";
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -17,6 +17,29 @@ export default function RegisterPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  const selectedCountry = COUNTRIES.find((c) => c.code === country) ?? null;
+  const filtered = search.trim()
+    ? COUNTRIES.filter((c) =>
+        c.name.toLowerCase().includes(search.toLowerCase()) ||
+        c.code.toLowerCase().includes(search.toLowerCase())
+      )
+    : COUNTRIES;
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+        setSearch("");
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -92,21 +115,86 @@ export default function RegisterPage() {
             <label className="block text-sm font-medium text-neutral-300">
               Country
             </label>
-            <select
-              value={country}
-              onChange={(e) => setCountry(e.target.value)}
-              required
-              className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-4 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition appearance-none"
-            >
-              <option value="" disabled>
-                Select your country…
-              </option>
-              {COUNTRIES.map((c) => (
-                <option key={c.code} value={c.code}>
-                  {c.name} ({c.code})
-                </option>
-              ))}
-            </select>
+            <div ref={dropdownRef} className="relative">
+              <input type="hidden" name="country" value={country} required />
+              <button
+                type="button"
+                onClick={() => {
+                  setDropdownOpen((v) => !v);
+                  setSearch("");
+                }}
+                className={`w-full flex items-center gap-2.5 rounded-lg bg-neutral-800 border px-4 py-2.5 text-sm text-left transition focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent ${
+                  dropdownOpen ? "border-violet-500" : "border-neutral-700"
+                }`}
+              >
+                {selectedCountry ? (
+                  <>
+                    <img
+                      src={flagUrl(selectedCountry.code)}
+                      alt={selectedCountry.code}
+                      width={20}
+                      height={15}
+                      className="rounded-sm object-cover flex-shrink-0"
+                    />
+                    <span className="text-white">{selectedCountry.name}</span>
+                  </>
+                ) : (
+                  <span className="text-neutral-500">Select your country…</span>
+                )}
+                <svg
+                  className="ml-auto w-4 h-4 text-neutral-500 flex-shrink-0"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+
+              {dropdownOpen && (
+                <div className="absolute z-50 mt-1 w-full rounded-lg bg-neutral-800 border border-neutral-700 shadow-xl overflow-hidden">
+                  <div className="p-2 border-b border-neutral-700">
+                    <input
+                      type="text"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      placeholder="Search…"
+                      autoFocus
+                      className="w-full rounded-md bg-neutral-700 border border-neutral-600 px-3 py-1.5 text-sm text-white placeholder-neutral-400 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                    />
+                  </div>
+                  <ul className="max-h-52 overflow-y-auto">
+                    {filtered.length === 0 && (
+                      <li className="px-4 py-3 text-sm text-neutral-500">No results</li>
+                    )}
+                    {filtered.map((c) => (
+                      <li key={c.code}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCountry(c.code);
+                            setDropdownOpen(false);
+                            setSearch("");
+                          }}
+                          className={`w-full flex items-center gap-2.5 px-4 py-2 text-sm text-left hover:bg-neutral-700 transition ${
+                            country === c.code ? "text-violet-400" : "text-neutral-200"
+                          }`}
+                        >
+                          <img
+                            src={flagUrl(c.code)}
+                            alt={c.code}
+                            width={20}
+                            height={15}
+                            className="rounded-sm object-cover flex-shrink-0"
+                          />
+                          {c.name}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="space-y-1.5">
@@ -127,7 +215,7 @@ export default function RegisterPage() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !country}
             className="w-full bg-violet-600 hover:bg-violet-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold rounded-lg py-2.5 text-sm transition focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-2 focus:ring-offset-neutral-900"
           >
             {loading ? "Creating account…" : "Create account"}
