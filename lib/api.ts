@@ -139,6 +139,10 @@ export function getRoom(roomId: string) {
   return apiFetch<Room>(`/rooms/${roomId}`);
 }
 
+export function getMyRooms() {
+  return apiFetch<Room[]>("/rooms/me");
+}
+
 export function getRoomMessages(roomId: string) {
   return apiFetch<Message[]>(`/rooms/${roomId}/messages`);
 }

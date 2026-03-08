@@ -2,13 +2,19 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { joinPool, leavePool } from "@/lib/api";
+import { joinPool, leavePool, getMyRooms, type Room } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { flagUrl } from "@/lib/countries";
 
 type PoolState = "idle" | "searching" | "matched";
 
 const POLL_INTERVAL = 4000;
+
+function isAlreadyInPoolError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return msg.includes("already") && msg.includes("pool");
+}
 
 export default function PoolPage() {
   const router = useRouter();
@@ -19,10 +25,33 @@ export default function PoolPage() {
   const [sameCountry, setSameCountry] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [activeRooms, setActiveRooms] = useState<Room[]>([]);
+  const [loadingRooms, setLoadingRooms] = useState(true);
 
   const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef = useRef(false);
   const startTimeRef = useRef<number>(0);
+  const knownRoomIdsRef = useRef<Set<string>>(new Set());
+
+  const fetchActiveRooms = useCallback(async () => {
+    try {
+      const rooms = await getMyRooms();
+      const now = Date.now();
+      setActiveRooms(
+        (rooms ?? []).filter(
+          (r) => r.is_active && new Date(r.expires_at).getTime() > now
+        )
+      );
+    } catch {
+      setActiveRooms([]);
+    } finally {
+      setLoadingRooms(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchActiveRooms();
+  }, [fetchActiveRooms]);
 
   const stopPolling = useCallback(() => {
     activeRef.current = false;
@@ -35,23 +64,28 @@ export default function PoolPage() {
   const poll = useCallback(async () => {
     if (!activeRef.current) return;
     try {
-      try { await leavePool(); } catch { /* not in pool */ }
-      const data = await joinPool(sameCountry);
+      const rooms = await getMyRooms();
       if (!activeRef.current) return;
-      if (data.room_id) {
+      const now = Date.now();
+      const newRoom = (rooms ?? []).find(
+        (r) =>
+          r.is_active &&
+          new Date(r.expires_at).getTime() > now &&
+          !knownRoomIdsRef.current.has(r.id)
+      );
+      if (newRoom) {
         stopPolling();
         setState("matched");
-        router.push(`/chat/${data.room_id}`);
+        try { await leavePool(); } catch {}
+        router.push(`/chat/${newRoom.id}`);
         return;
       }
       pollingRef.current = setTimeout(poll, POLL_INTERVAL);
-    } catch (err) {
+    } catch {
       if (!activeRef.current) return;
-      stopPolling();
-      setState("idle");
-      setError(err instanceof Error ? err.message : "Something went wrong.");
+      pollingRef.current = setTimeout(poll, POLL_INTERVAL);
     }
-  }, [sameCountry, router, stopPolling]);
+  }, [router, stopPolling]);
 
   const handleSearch = useCallback(async () => {
     setError(null);
@@ -59,18 +93,31 @@ export default function PoolPage() {
     setElapsed(0);
     startTimeRef.current = Date.now();
     activeRef.current = true;
+
+    try {
+      const existingRooms = await getMyRooms();
+      knownRoomIdsRef.current = new Set((existingRooms ?? []).map((r) => r.id));
+    } catch {
+      knownRoomIdsRef.current = new Set();
+    }
+
     try {
       const data = await joinPool(sameCountry);
       if (!activeRef.current) return;
       if (data.room_id) {
         stopPolling();
         setState("matched");
+        try { await leavePool(); } catch {}
         router.push(`/chat/${data.room_id}`);
         return;
       }
       pollingRef.current = setTimeout(poll, POLL_INTERVAL);
     } catch (err) {
       if (!activeRef.current) return;
+      if (isAlreadyInPoolError(err)) {
+        pollingRef.current = setTimeout(poll, POLL_INTERVAL);
+        return;
+      }
       stopPolling();
       setState("idle");
       setError(err instanceof Error ? err.message : "Something went wrong.");
@@ -81,7 +128,9 @@ export default function PoolPage() {
     stopPolling();
     setState("idle");
     setElapsed(0);
-    try { await leavePool(); } catch { /* ignore */ }
+    try {
+      await leavePool();
+    } catch { /* ignore */ }
   }, [stopPolling]);
 
   useEffect(() => {
@@ -98,7 +147,9 @@ export default function PoolPage() {
 
   async function handleLogout() {
     stopPolling();
-    try { await leavePool(); } catch { /* not in pool, ignore */ }
+    try {
+      await leavePool();
+    } catch { /* not in pool, ignore */ }
     clearAuth();
     router.push("/login");
   }
@@ -107,6 +158,14 @@ export default function PoolPage() {
     const m = Math.floor(s / 60);
     const sec = s % 60;
     return `${m}:${String(sec).padStart(2, "0")}`;
+  }
+
+  function formatRemaining(expiresAt: string): string {
+    const diff = new Date(expiresAt).getTime() - Date.now();
+    if (diff <= 0) return "Expired";
+    const h = Math.floor(diff / 3_600_000);
+    const m = Math.floor((diff % 3_600_000) / 60_000);
+    return `${h}h ${m}m left`;
   }
 
   return (
@@ -150,6 +209,59 @@ export default function PoolPage() {
             {error && (
               <div className="rounded-lg bg-red-900/40 border border-red-700 px-4 py-3 text-sm text-red-300 text-left">
                 {error}
+              </div>
+            )}
+
+            {!loadingRooms && activeRooms.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider text-left">
+                  Active rooms
+                </p>
+                <ul className="space-y-2">
+                  {activeRooms.map((room) => {
+                    const partnerCountry =
+                      room.country_a === user?.country
+                        ? room.country_b
+                        : room.country_a;
+                    return (
+                      <li key={room.id}>
+                        <button
+                          onClick={() => router.push(`/chat/${room.id}`)}
+                          className="w-full flex items-center gap-3 bg-neutral-900 border border-neutral-800 hover:border-neutral-700 rounded-xl px-4 py-3 text-left transition group"
+                        >
+                          <img
+                            src={flagUrl(partnerCountry)}
+                            alt={partnerCountry}
+                            width={24}
+                            height={18}
+                            className="rounded-sm object-cover flex-shrink-0"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-neutral-200 group-hover:text-white transition">
+                              Stranger
+                            </p>
+                            <p className="text-xs text-neutral-500">
+                              {formatRemaining(room.expires_at)}
+                            </p>
+                          </div>
+                          <svg
+                            className="w-4 h-4 text-neutral-600 group-hover:text-neutral-400 transition flex-shrink-0"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M9 5l7 7-7 7"
+                            />
+                          </svg>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
               </div>
             )}
 
@@ -212,9 +324,7 @@ export default function PoolPage() {
             </div>
 
             <div className="space-y-1">
-              <p className="text-lg font-semibold text-white">
-                Searching for a match…
-              </p>
+              <p className="text-lg font-semibold text-white">Searching for a match…</p>
               <p className="text-sm text-neutral-400">
                 {sameCountry ? "Looking for someone in your country" : "Looking worldwide"}
               </p>
