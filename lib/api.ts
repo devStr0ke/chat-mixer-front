@@ -123,6 +123,8 @@ export interface Room {
   id: string;
   country_a: string;
   country_b: string;
+  user_a_room_name: string;
+  user_b_room_name: string;
   created_at: string;
   expires_at: string;
   is_active: boolean;
@@ -132,6 +134,7 @@ export interface Message {
   id: string;
   sender_id: string;
   content: string;
+  is_read: boolean;
   sent_at: string;
 }
 
@@ -146,6 +149,30 @@ export function getMyRooms() {
 export function getRoomMessages(roomId: string) {
   return apiFetch<Message[]>(`/rooms/${roomId}/messages`);
 }
+
+export function renameRoom(roomId: string, name: string) {
+  return apiFetch<{ message: string }>(`/rooms/${roomId}/name`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteRoom(roomId: string) {
+  return apiFetch<{ message: string }>(`/rooms/${roomId}`, {
+    method: "DELETE",
+  });
+}
+
+export type WsOutgoing =
+  | { type: "message"; content: string }
+  | { type: "typing" }
+  | { type: "read"; id: string };
+
+export type WsIncoming =
+  | { type: "message"; id: string; content: string }
+  | { type: "message_ack"; id: string }
+  | { type: "typing" }
+  | { type: "read"; id: string };
 
 export function createChatWebSocket(roomId: string): WebSocket {
   const token = getToken();

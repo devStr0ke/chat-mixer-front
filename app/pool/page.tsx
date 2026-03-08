@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { joinPool, leavePool, getMyRooms, type Room } from "@/lib/api";
+import { joinPool, leavePool, getMyRooms, getRoomMessages, type Room } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { flagUrl } from "@/lib/countries";
 
@@ -27,6 +27,7 @@ export default function PoolPage() {
   const [elapsed, setElapsed] = useState(0);
   const [activeRooms, setActiveRooms] = useState<Room[]>([]);
   const [loadingRooms, setLoadingRooms] = useState(true);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
 
   const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef = useRef(false);
@@ -37,17 +38,31 @@ export default function PoolPage() {
     try {
       const rooms = await getMyRooms();
       const now = Date.now();
-      setActiveRooms(
-        (rooms ?? []).filter(
-          (r) => r.is_active && new Date(r.expires_at).getTime() > now
-        )
+      const active = (rooms ?? []).filter(
+        (r) => r.is_active && new Date(r.expires_at).getTime() > now
       );
+      setActiveRooms(active);
+
+      const counts: Record<string, number> = {};
+      await Promise.all(
+        active.map(async (room) => {
+          try {
+            const msgs = await getRoomMessages(room.id);
+            counts[room.id] = (msgs ?? []).filter(
+              (m) => m.sender_id !== user?.id && !m.is_read
+            ).length;
+          } catch {
+            counts[room.id] = 0;
+          }
+        })
+      );
+      setUnreadCounts(counts);
     } catch {
       setActiveRooms([]);
     } finally {
       setLoadingRooms(false);
     }
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     fetchActiveRooms();
@@ -223,6 +238,10 @@ export default function PoolPage() {
                       room.country_a === user?.country
                         ? room.country_b
                         : room.country_a;
+                    const roomName =
+                      room.country_a === user?.country
+                        ? room.user_a_room_name
+                        : room.user_b_room_name;
                     return (
                       <li key={room.id}>
                         <button
@@ -238,25 +257,31 @@ export default function PoolPage() {
                           />
                           <div className="flex-1 min-w-0">
                             <p className="text-sm font-medium text-neutral-200 group-hover:text-white transition">
-                              Stranger
+                              {roomName || "Stranger"}
                             </p>
                             <p className="text-xs text-neutral-500">
                               {formatRemaining(room.expires_at)}
                             </p>
                           </div>
-                          <svg
-                            className="w-4 h-4 text-neutral-600 group-hover:text-neutral-400 transition flex-shrink-0"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={2}
-                              d="M9 5l7 7-7 7"
-                            />
-                          </svg>
+                          {(unreadCounts[room.id] ?? 0) > 0 ? (
+                            <span className="flex-shrink-0 min-w-[20px] h-5 px-1.5 flex items-center justify-center rounded-full bg-violet-600 text-[11px] font-semibold text-white tabular-nums">
+                              {unreadCounts[room.id]}
+                            </span>
+                          ) : (
+                            <svg
+                              className="w-4 h-4 text-neutral-600 group-hover:text-neutral-400 transition flex-shrink-0"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M9 5l7 7-7 7"
+                              />
+                            </svg>
+                          )}
                         </button>
                       </li>
                     );

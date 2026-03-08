@@ -6,13 +6,22 @@ import {
   getRoom,
   getRoomMessages,
   createChatWebSocket,
+  deleteRoom,
+  renameRoom,
   type Room,
   type Message,
+  type WsOutgoing,
+  type WsIncoming,
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { flagUrl } from "@/lib/countries";
 
 type ConnectionState = "connecting" | "open" | "closed";
+
+const MAX_RECONNECTS = 10;
+const RECONNECT_DELAY = 2000;
+const TYPING_THROTTLE = 3000;
+const TYPING_TIMEOUT = 4000;
 
 export default function ChatPage() {
   const { room_id } = useParams<{ room_id: string }>();
@@ -24,20 +33,35 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [connState, setConnState] = useState<ConnectionState>("connecting");
   const [expired, setExpired] = useState(false);
+  const [deleted, setDeleted] = useState(false);
   const [remaining, setRemaining] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [partnerTyping, setPartnerTyping] = useState(false);
+  const [showMenu, setShowMenu] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [showRename, setShowRename] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const reconnectCountRef = useRef(0);
   const localIdRef = useRef(0);
-  const MAX_RECONNECTS = 10;
-  const RECONNECT_DELAY = 2000;
+  const lastTypingSentRef = useRef(0);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deletedRef = useRef(false);
+  const pendingAckQueue = useRef<string[]>([]);
+
+  const messagesRef = useRef<Message[]>([]);
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
+
+  function wsSend(payload: WsOutgoing) {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload));
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -53,6 +77,7 @@ export default function ChatPage() {
 
         setRoom(roomData);
         setMessages(history ?? []);
+        messagesRef.current = history ?? [];
 
         if (!roomData.is_active || new Date(roomData.expires_at).getTime() <= Date.now()) {
           setExpired(true);
@@ -80,24 +105,83 @@ export default function ChatPage() {
         if (cancelled) return;
         reconnectCountRef.current = 0;
         setConnState("open");
+
+        const unread = messagesRef.current.filter(
+          (m) => m.sender_id !== user?.id && !m.is_read
+        );
+        unread.forEach((m) => {
+          ws.send(JSON.stringify({ type: "read", id: m.id }));
+        });
+        if (unread.length > 0) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.sender_id !== user?.id && !m.is_read ? { ...m, is_read: true } : m
+            )
+          );
+        }
       });
 
       ws.addEventListener("message", (e) => {
         if (cancelled) return;
-        localIdRef.current += 1;
-        const incoming: Message = {
-          id: `remote-${localIdRef.current}`,
-          sender_id: "partner",
-          content: String(e.data),
-          sent_at: new Date().toISOString(),
-        };
-        setMessages((prev) => [...prev, incoming]);
+        let incoming: WsIncoming;
+        try {
+          incoming = JSON.parse(e.data);
+        } catch {
+          return;
+        }
+
+        if (incoming.type === "message") {
+          const msg: Message = {
+            id: incoming.id,
+            sender_id: "partner",
+            content: incoming.content,
+            is_read: false,
+            sent_at: new Date().toISOString(),
+          };
+          setMessages((prev) => [...prev, msg]);
+          setPartnerTyping(false);
+          wsSend({ type: "read", id: incoming.id });
+        }
+
+        if (incoming.type === "message_ack") {
+          const localId = pendingAckQueue.current.shift();
+          if (localId) {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === localId ? { ...m, id: incoming.id } : m))
+            );
+          }
+        }
+
+        if (incoming.type === "typing") {
+          setPartnerTyping(true);
+          if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+          typingTimeoutRef.current = setTimeout(() => setPartnerTyping(false), TYPING_TIMEOUT);
+        }
+
+        if (incoming.type === "read") {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === incoming.id ? { ...m, is_read: true } : m))
+          );
+        }
       });
 
-      ws.addEventListener("close", (e) => {
+      ws.addEventListener("close", async (e) => {
         if (cancelled) return;
         console.warn(`[WS] closed code=${e.code} reason=${e.reason} attempt=${reconnectCountRef.current}`);
         wsRef.current = null;
+
+        if (deletedRef.current) return;
+
+        try {
+          const freshRoom = await getRoom(room_id);
+          if (!freshRoom.is_active) {
+            deletedRef.current = true;
+            setDeleted(true);
+            setConnState("closed");
+            return;
+          }
+        } catch {}
+
         if (reconnectCountRef.current < MAX_RECONNECTS) {
           reconnectCountRef.current += 1;
           setConnState("connecting");
@@ -117,16 +201,21 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
       }
     };
-  }, [room_id]);
+  }, [room_id, user]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, scrollToBottom]);
+  }, [messages, partnerTyping, scrollToBottom]);
 
   useEffect(() => {
     if (!room) return;
@@ -157,22 +246,76 @@ export default function ChatPage() {
     e.preventDefault();
     const text = input.trim();
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !user) return;
-    wsRef.current.send(text);
     localIdRef.current += 1;
+    const localId = `local-${localIdRef.current}`;
+    pendingAckQueue.current.push(localId);
+    wsSend({ type: "message", content: text });
     const localMsg: Message = {
-      id: `local-${localIdRef.current}`,
+      id: localId,
       sender_id: user.id,
       content: text,
+      is_read: false,
       sent_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, localMsg]);
     setInput("");
+    lastTypingSentRef.current = 0;
     inputRef.current?.focus();
+  }
+
+  function handleInputChange(value: string) {
+    setInput(value);
+    const now = Date.now();
+    if (value.trim() && now - lastTypingSentRef.current > TYPING_THROTTLE) {
+      lastTypingSentRef.current = now;
+      wsSend({ type: "typing" });
+    }
+  }
+
+  async function handleDelete() {
+    if (!confirm("End this conversation? All messages will be deleted for both users.")) return;
+    try {
+      await deleteRoom(room_id);
+      deletedRef.current = true;
+      setDeleted(true);
+      setConnState("closed");
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete room.");
+    }
+  }
+
+  async function handleRename(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const name = renameValue.trim();
+    if (!name) return;
+    try {
+      await renameRoom(room_id, name);
+      setRoom((prev) => {
+        if (!prev) return prev;
+        const isUserA = prev.country_a === user?.country;
+        return isUserA
+          ? { ...prev, user_a_room_name: name }
+          : { ...prev, user_b_room_name: name };
+      });
+      setShowRename(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rename.");
+    }
   }
 
   function partnerCountry(): string {
     if (!room || !user) return "";
     return room.country_a === user.country ? room.country_b : room.country_a;
+  }
+
+  function partnerName(): string {
+    if (!room || !user) return "Stranger";
+    const isUserA = room.country_a === user.country;
+    return isUserA ? room.user_a_room_name : room.user_b_room_name;
   }
 
   if (error) {
@@ -197,6 +340,8 @@ export default function ChatPage() {
     );
   }
 
+  const ended = expired || deleted;
+
   return (
     <div className="h-dvh bg-neutral-950 flex flex-col">
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800 flex-shrink-0">
@@ -217,11 +362,19 @@ export default function ChatPage() {
               height={15}
               className="rounded-sm object-cover"
             />
-            <span className="text-sm font-medium text-neutral-200">Stranger</span>
+            <div className="flex flex-col">
+              <span className="text-sm font-medium text-neutral-200 leading-tight">
+                {partnerName()}
+              </span>
+              {partnerTyping && connState === "open" && (
+                <span className="text-[11px] text-violet-400 leading-tight">typing…</span>
+              )}
+            </div>
           </div>
         </div>
+
         <div className="flex items-center gap-3">
-          {connState === "open" && (
+          {connState === "open" && !partnerTyping && (
             <span className="flex items-center gap-1.5 text-xs text-green-400">
               <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
               Connected
@@ -230,20 +383,83 @@ export default function ChatPage() {
           {connState === "connecting" && (
             <span className="text-xs text-neutral-500">Connecting…</span>
           )}
-          {connState === "closed" && !expired && (
+          {connState === "closed" && !ended && (
             <span className="flex items-center gap-1.5 text-xs text-red-400">
               <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
               Disconnected
             </span>
           )}
-          {remaining && (
+          {remaining && !ended && (
             <span className="text-xs font-mono text-neutral-500">{remaining}</span>
+          )}
+
+          {!ended && (
+            <div className="relative">
+              <button
+                onClick={() => setShowMenu((v) => !v)}
+                className="text-neutral-500 hover:text-neutral-300 transition p-1"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01" />
+                </svg>
+              </button>
+              {showMenu && (
+                <div className="absolute right-0 top-full mt-1 w-44 bg-neutral-900 border border-neutral-800 rounded-xl shadow-lg z-50 overflow-hidden">
+                  <button
+                    onClick={() => {
+                      setRenameValue(partnerName());
+                      setShowRename(true);
+                      setShowMenu(false);
+                    }}
+                    className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
+                  >
+                    Rename room
+                  </button>
+                  <button
+                    onClick={handleDelete}
+                    className="w-full text-left px-4 py-2.5 text-sm text-red-400 hover:bg-neutral-800 transition"
+                  >
+                    End conversation
+                  </button>
+                </div>
+              )}
+            </div>
           )}
         </div>
       </header>
 
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2">
-        {messages.length === 0 && !expired && (
+      {showRename && (
+        <div className="border-b border-neutral-800 px-4 py-3 bg-neutral-900/50 flex-shrink-0">
+          <form onSubmit={handleRename} className="flex items-center gap-2">
+            <input
+              type="text"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              maxLength={64}
+              placeholder="Enter a name…"
+              autoFocus
+              className="flex-1 bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+            <button
+              type="submit"
+              disabled={!renameValue.trim()}
+              className="px-3 py-1.5 text-xs font-medium bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white rounded-lg transition"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowRename(false)}
+              className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 transition"
+            >
+              Cancel
+            </button>
+          </form>
+        </div>
+      )}
+
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2" onClick={() => setShowMenu(false)}>
+        {messages.length === 0 && !ended && (
           <div className="flex items-center justify-center h-full">
             <p className="text-sm text-neutral-600">Say hi to your stranger.</p>
           </div>
@@ -264,25 +480,57 @@ export default function ChatPage() {
                 }`}
               >
                 <p>{msg.content}</p>
-                <p
-                  className={`text-[10px] mt-1 ${
-                    isOwn ? "text-violet-300" : "text-neutral-500"
-                  }`}
-                >
-                  {new Date(msg.sent_at).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                </p>
+                <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
+                  <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
+                    {new Date(msg.sent_at).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                  {isOwn && (
+                    <svg
+                      className={`w-3.5 h-3.5 ${msg.is_read ? "text-violet-300" : "text-violet-400/40"}`}
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      {msg.is_read ? (
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
+                      ) : (
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
+                      )}
+                    </svg>
+                  )}
+                </div>
               </div>
             </div>
           );
         })}
 
+        {partnerTyping && connState === "open" && (
+          <div className="flex justify-start">
+            <div className="bg-neutral-800 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:0ms]" />
+              <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:150ms]" />
+              <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:300ms]" />
+            </div>
+          </div>
+        )}
+
         <div ref={bottomRef} />
       </div>
 
-      {expired ? (
+      {deleted ? (
+        <div className="border-t border-neutral-800 px-4 py-5 text-center flex-shrink-0">
+          <p className="text-sm text-neutral-400 mb-3">This conversation has ended.</p>
+          <button
+            onClick={() => router.push("/pool")}
+            className="px-5 py-2 text-sm font-medium bg-violet-600 hover:bg-violet-500 text-white rounded-xl transition"
+          >
+            Find a new match
+          </button>
+        </div>
+      ) : expired ? (
         <div className="border-t border-neutral-800 px-4 py-5 text-center flex-shrink-0">
           <p className="text-sm text-neutral-400 mb-3">This room has expired.</p>
           <button
@@ -301,7 +549,7 @@ export default function ChatPage() {
             ref={inputRef}
             type="text"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => handleInputChange(e.target.value)}
             placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
             disabled={connState !== "open"}
             autoFocus
