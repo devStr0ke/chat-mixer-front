@@ -1,36 +1,58 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Chat Mixer — Frontend
+
+Chat Mixer is an anonymous, ephemeral real-time chat app. Users register with a pseudo and a country, then get matched with a random stranger for a 24-hour conversation window. Each conversation is isolated —> no history is kept after expiry.
+
+**Features:**
+- Anonymous matchmaking (worldwide or same-country)
+- Real-time messaging over WebSocket (JSON protocol)
+- Typing indicators and read receipts
+- Room rename and delete
+- Instant unread badge updates via a global notification WebSocket
+- JWT authentication with automatic expiry handling
+
+---
+
+## Requirements
+
+- [Node.js](https://nodejs.org) 20+
+- [pnpm](https://pnpm.io)
+- The [Chat Mixer backend](https://github.com/devStr0ke/chat-mixer) running
+
+---
+
+## Environment Variables
+
+Create a `.env.local` file at the root of the project:
+
+```bash
+# Base URL of the Chat Mixer backend (used for HTTP API calls and WS host fallback)
+NEXT_PUBLIC_API_URL=http://localhost:8080
+
+# Optional — only needed for LAN testing between two devices on the same network.
+# When set, all WebSocket connections (chat + notifications) will use this host instead
+# of the host extracted from NEXT_PUBLIC_API_URL.
+# Format: host:port (no protocol prefix)
+# NEXT_PUBLIC_WS_HOST=192.168.1.12:8080
+```
+
+> **Note:** After modifying `.env.local`, restart the dev server for changes to take effect.
+
+---
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Build for Production
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+pnpm build
+pnpm start
+```
