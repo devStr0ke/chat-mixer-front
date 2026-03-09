@@ -2,7 +2,15 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { joinPool, leavePool, getMyRooms, getRoomMessages, type Room } from "@/lib/api";
+import {
+  joinPool,
+  leavePool,
+  getMyRooms,
+  getRoomMessages,
+  createNotificationWebSocket,
+  type Room,
+  type WsNotification,
+} from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { flagUrl } from "@/lib/countries";
 
@@ -33,6 +41,8 @@ export default function PoolPage() {
   const activeRef = useRef(false);
   const startTimeRef = useRef<number>(0);
   const knownRoomIdsRef = useRef<Set<string>>(new Set());
+  const notifWsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchActiveRooms = useCallback(async () => {
     try {
@@ -67,6 +77,51 @@ export default function PoolPage() {
   useEffect(() => {
     fetchActiveRooms();
   }, [fetchActiveRooms]);
+
+  useEffect(() => {
+    let alive = true;
+
+    function connect() {
+      if (!alive) return;
+      const ws = createNotificationWebSocket();
+      notifWsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const msg: WsNotification = JSON.parse(event.data);
+          switch (msg.type) {
+            case "new_message":
+              setUnreadCounts((prev) => ({
+                ...prev,
+                [msg.room_id]: (prev[msg.room_id] ?? 0) + 1,
+              }));
+              break;
+            case "room_closed":
+              setActiveRooms((prev) => prev.filter((r) => r.id !== msg.room_id));
+              setUnreadCounts((prev) => {
+                const next = { ...prev };
+                delete next[msg.room_id];
+                return next;
+              });
+              break;
+          }
+        } catch { /* ignore malformed frames */ }
+      };
+
+      ws.onclose = () => {
+        if (!alive) return;
+        reconnectTimerRef.current = setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+
+    return () => {
+      alive = false;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      notifWsRef.current?.close();
+    };
+  }, []);
 
   const stopPolling = useCallback(() => {
     activeRef.current = false;
@@ -162,6 +217,7 @@ export default function PoolPage() {
 
   async function handleLogout() {
     stopPolling();
+    notifWsRef.current?.close();
     try {
       await leavePool();
     } catch { /* not in pool, ignore */ }

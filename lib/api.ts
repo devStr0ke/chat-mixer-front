@@ -174,9 +174,20 @@ export type WsIncoming =
   | { type: "typing" }
   | { type: "read"; id: string };
 
+export type WsNotification =
+  | { type: "new_message"; room_id: string; id: string }
+  | { type: "room_closed"; room_id: string };
+
 export function createChatWebSocket(roomId: string): WebSocket {
   const token = getToken();
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const wsHost = process.env.NEXT_PUBLIC_WS_HOST ?? BASE_URL.replace(/^https?:\/\//, "");
   return new WebSocket(`${protocol}://${wsHost}/ws/${roomId}?token=${token ?? ""}`);
+}
+
+export function createNotificationWebSocket(): WebSocket {
+  const token = getToken();
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const wsHost = process.env.NEXT_PUBLIC_WS_HOST ?? BASE_URL.replace(/^https?:\/\//, "");
+  return new WebSocket(`${protocol}://${wsHost}/ws/notifications?token=${token ?? ""}`);
 }
