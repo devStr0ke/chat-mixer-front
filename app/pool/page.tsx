@@ -44,6 +44,18 @@ export default function PoolPage() {
   const notifWsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const closeNotifWs = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (notifWsRef.current) {
+      notifWsRef.current.onclose = null;
+      notifWsRef.current.close(1000);
+      notifWsRef.current = null;
+    }
+  }, []);
+
   const fetchActiveRooms = useCallback(async () => {
     try {
       const rooms = await getMyRooms();
@@ -79,12 +91,21 @@ export default function PoolPage() {
   }, [fetchActiveRooms]);
 
   useEffect(() => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+
     let alive = true;
+    let retries = 0;
+    const MAX_RETRIES = 5;
 
     function connect() {
       if (!alive) return;
       const ws = createNotificationWebSocket();
       notifWsRef.current = ws;
+
+      ws.onopen = () => {
+        retries = 0;
+      };
 
       ws.onmessage = (event) => {
         try {
@@ -108,20 +129,23 @@ export default function PoolPage() {
         } catch { /* ignore malformed frames */ }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         if (!alive) return;
-        reconnectTimerRef.current = setTimeout(connect, 3000);
+        if (e.code === 1000) return;
+        if (retries >= MAX_RETRIES) return;
+        retries++;
+        reconnectTimerRef.current = setTimeout(connect, 3000 * retries);
       };
     }
 
-    connect();
+    const initTimer = setTimeout(connect, 100);
 
     return () => {
       alive = false;
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      notifWsRef.current?.close();
+      clearTimeout(initTimer);
+      closeNotifWs();
     };
-  }, []);
+  }, [closeNotifWs]);
 
   const stopPolling = useCallback(() => {
     activeRef.current = false;
@@ -147,6 +171,7 @@ export default function PoolPage() {
         stopPolling();
         setState("matched");
         try { await leavePool(); } catch {}
+        closeNotifWs();
         router.push(`/chat/${newRoom.id}`);
         return;
       }
@@ -155,7 +180,7 @@ export default function PoolPage() {
       if (!activeRef.current) return;
       pollingRef.current = setTimeout(poll, POLL_INTERVAL);
     }
-  }, [router, stopPolling]);
+  }, [router, stopPolling, closeNotifWs]);
 
   const handleSearch = useCallback(async () => {
     setError(null);
@@ -178,6 +203,7 @@ export default function PoolPage() {
         stopPolling();
         setState("matched");
         try { await leavePool(); } catch {}
+        closeNotifWs();
         router.push(`/chat/${data.room_id}`);
         return;
       }
@@ -192,7 +218,7 @@ export default function PoolPage() {
       setState("idle");
       setError(err instanceof Error ? err.message : "Something went wrong.");
     }
-  }, [sameCountry, router, poll, stopPolling]);
+  }, [sameCountry, router, poll, stopPolling, closeNotifWs]);
 
   const handleCancel = useCallback(async () => {
     stopPolling();
@@ -217,7 +243,7 @@ export default function PoolPage() {
 
   async function handleLogout() {
     stopPolling();
-    notifWsRef.current?.close();
+    closeNotifWs();
     try {
       await leavePool();
     } catch { /* not in pool, ignore */ }
@@ -301,7 +327,10 @@ export default function PoolPage() {
                     return (
                       <li key={room.id}>
                         <button
-                          onClick={() => router.push(`/chat/${room.id}`)}
+                          onClick={() => {
+                            closeNotifWs();
+                            router.push(`/chat/${room.id}`);
+                          }}
                           className="w-full flex items-center gap-3 bg-neutral-900 border border-neutral-800 hover:border-neutral-700 rounded-xl px-4 py-3 text-left transition group"
                         >
                           <img
