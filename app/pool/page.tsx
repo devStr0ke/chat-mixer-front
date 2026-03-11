@@ -36,7 +36,7 @@ export default function PoolPage() {
   const [activeRooms, setActiveRooms] = useState<Room[]>([]);
   const [loadingRooms, setLoadingRooms] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
-  const [onlineCount, setOnlineCount] = useState<number | null>(null);
+  const [onlineLabel, setOnlineLabel] = useState<string | null>(null);
 
   const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef = useRef(false);
@@ -112,9 +112,17 @@ export default function PoolPage() {
         try {
           const msg: WsNotification = JSON.parse(event.data);
           switch (msg.type) {
-            case "online_count":
-              setOnlineCount(msg.count);
+            case "online_count": {
+              const others = msg.count - 1;
+              if (others <= 0) {
+                setOnlineLabel("Only you are online");
+              } else if (others === 1) {
+                setOnlineLabel("You and 1 other user online");
+              } else {
+                setOnlineLabel(`You and ${others} other users online`);
+              }
               break;
+            }
             case "new_message":
               setUnreadCounts((prev) => ({
                 ...prev,
@@ -305,10 +313,10 @@ export default function PoolPage() {
               <p className="text-sm text-neutral-400">
                 Get matched with a random anonymous user for a 24h chat.
               </p>
-              {onlineCount !== null && (
+              {onlineLabel !== null && (
                 <p className="text-xs text-neutral-500 flex items-center justify-center gap-1.5">
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  {onlineCount === 1 ? "1 user online" : `${onlineCount} users online`}
+                  {onlineLabel}
                 </p>
               )}
             </div>
@@ -451,10 +459,10 @@ export default function PoolPage() {
               <p className="text-xs text-neutral-500 font-mono mt-2">
                 {formatElapsed(elapsed)}
               </p>
-              {onlineCount !== null && (
+              {onlineLabel !== null && (
                 <p className="text-xs text-neutral-500 flex items-center justify-center gap-1.5 mt-1">
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  {onlineCount === 1 ? "1 user online" : `${onlineCount} users online`}
+                  {onlineLabel}
                 </p>
               )}
             </div>
