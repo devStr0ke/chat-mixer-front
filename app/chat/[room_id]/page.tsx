@@ -8,8 +8,11 @@ import {
   createChatWebSocket,
   deleteRoom,
   renameRoom,
+  addReaction,
+  removeReaction,
   type Room,
   type Message,
+  type Reaction,
   type WsOutgoing,
   type WsIncoming,
 } from "@/lib/api";
@@ -40,6 +43,7 @@ export default function ChatPage() {
   const [showMenu, setShowMenu] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [showRename, setShowRename] = useState(false);
+  const [contextMsg, setContextMsg] = useState<Message | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -50,6 +54,8 @@ export default function ChatPage() {
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deletedRef = useRef(false);
   const pendingAckQueue = useRef<string[]>([]);
+  const lastTapRef = useRef<{ id: string; time: number } | null>(null);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const messagesRef = useRef<Message[]>([]);
 
@@ -137,6 +143,7 @@ export default function ChatPage() {
             content: incoming.content,
             is_read: false,
             sent_at: new Date().toISOString(),
+            reactions: [],
           };
           setMessages((prev) => [...prev, msg]);
           setPartnerTyping(false);
@@ -161,6 +168,19 @@ export default function ChatPage() {
         if (incoming.type === "read") {
           setMessages((prev) =>
             prev.map((m) => (m.id === incoming.id ? { ...m, is_read: true } : m))
+          );
+        }
+
+        if (incoming.type === "reaction") {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== incoming.message_id) return m;
+              if (incoming.action === "remove") {
+                return { ...m, reactions: m.reactions.filter((r) => r.user_id !== incoming.user_id) };
+              }
+              const filtered = m.reactions.filter((r) => r.user_id !== incoming.user_id);
+              return { ...m, reactions: [...filtered, { user_id: incoming.user_id, emoji: incoming.emoji }] };
+            })
           );
         }
       });
@@ -256,6 +276,7 @@ export default function ChatPage() {
       content: text,
       is_read: false,
       sent_at: new Date().toISOString(),
+      reactions: [],
     };
     setMessages((prev) => [...prev, localMsg]);
     setInput("");
@@ -270,6 +291,35 @@ export default function ChatPage() {
       lastTypingSentRef.current = now;
       wsSend({ type: "typing" });
     }
+  }
+
+  function applyReactionOptimistically(messageId: string, reaction: Reaction | null) {
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== messageId) return m;
+        const filtered = m.reactions.filter((r) => r.user_id !== user?.id);
+        return { ...m, reactions: reaction ? [...filtered, reaction] : filtered };
+      })
+    );
+  }
+
+  async function handleReact(messageId: string, emoji: string) {
+    setContextMsg(null);
+    const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === user?.id);
+    if (existing?.emoji === emoji) {
+      applyReactionOptimistically(messageId, null);
+      try { await removeReaction(messageId); } catch { applyReactionOptimistically(messageId, existing); }
+      return;
+    }
+    applyReactionOptimistically(messageId, { user_id: user!.id, emoji });
+    try { await addReaction(messageId, emoji); } catch { applyReactionOptimistically(messageId, existing ?? null); }
+  }
+
+  async function handleRemoveReaction(messageId: string) {
+    const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === user?.id);
+    if (!existing) return;
+    applyReactionOptimistically(messageId, null);
+    try { await removeReaction(messageId); } catch { applyReactionOptimistically(messageId, existing); }
   }
 
   async function handleDelete() {
@@ -467,41 +517,94 @@ export default function ChatPage() {
 
         {messages.map((msg) => {
           const isOwn = msg.sender_id === user?.id;
+          const myReaction = msg.reactions.find((r) => r.user_id === user?.id);
+          const partnerReaction = msg.reactions.find((r) => r.user_id !== user?.id);
           return (
             <div
               key={msg.id}
               className={`flex ${isOwn ? "justify-end" : "justify-start"}`}
             >
-              <div
-                className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm break-words ${
-                  isOwn
-                    ? "bg-violet-600 text-white rounded-br-md"
-                    : "bg-neutral-800 text-neutral-100 rounded-bl-md"
-                }`}
-              >
-                <p>{msg.content}</p>
-                <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
-                  <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
-                    {new Date(msg.sent_at).toLocaleTimeString([], {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </span>
-                  {isOwn && (
-                    <svg
-                      className={`w-3.5 h-3.5 ${msg.is_read ? "text-violet-300" : "text-violet-400/40"}`}
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      {msg.is_read ? (
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
-                      ) : (
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
-                      )}
-                    </svg>
-                  )}
+              <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
+                <div
+                  className={`rounded-2xl px-4 py-2 text-sm break-words select-none touch-none ${
+                    isOwn
+                      ? "bg-violet-600 text-white rounded-br-md"
+                      : "bg-neutral-800 text-neutral-100 rounded-bl-md"
+                  }`}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    holdTimerRef.current = setTimeout(() => {
+                      holdTimerRef.current = null;
+                      lastTapRef.current = null;
+                      setContextMsg(msg);
+                    }, 400);
+                  }}
+                  onPointerUp={(e) => {
+                    e.stopPropagation();
+                    if (holdTimerRef.current) {
+                      clearTimeout(holdTimerRef.current);
+                      holdTimerRef.current = null;
+                      const now = Date.now();
+                      const last = lastTapRef.current;
+                      if (last?.id === msg.id && now - last.time < 300) {
+                        lastTapRef.current = null;
+                        handleReact(msg.id, "❤️");
+                      } else {
+                        lastTapRef.current = { id: msg.id, time: now };
+                      }
+                    }
+                  }}
+                  onPointerLeave={() => {
+                    if (holdTimerRef.current) {
+                      clearTimeout(holdTimerRef.current);
+                      holdTimerRef.current = null;
+                    }
+                  }}
+                >
+                  <p>{msg.content}</p>
+                  <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
+                    <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
+                      {new Date(msg.sent_at).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                    {isOwn && (
+                      <svg
+                        className={`w-3.5 h-3.5 ${msg.is_read ? "text-violet-300" : "text-violet-400/40"}`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        {msg.is_read ? (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
+                        ) : (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
+                        )}
+                      </svg>
+                    )}
+                  </div>
                 </div>
+
+                {/* Reaction badges */}
+                {(myReaction || partnerReaction) && (
+                  <div className="flex gap-1 mt-1 flex-wrap">
+                    {partnerReaction && (
+                      <span className="text-sm leading-none bg-neutral-800 border border-neutral-700 rounded-full px-2 py-0.5">
+                        {partnerReaction.emoji}
+                      </span>
+                    )}
+                    {myReaction && (
+                      <button
+                        onClick={() => handleRemoveReaction(msg.id)}
+                        className="text-sm leading-none bg-violet-600/20 border border-violet-500/40 rounded-full px-2 py-0.5 hover:bg-red-900/30 hover:border-red-500/40 transition"
+                        title="Remove your reaction"
+                      >
+                        {myReaction.emoji}
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           );
@@ -566,6 +669,54 @@ export default function ChatPage() {
           </button>
         </form>
       )}
+
+      {/* Long-press reaction overlay */}
+      {contextMsg && (() => {
+        const isOwn = contextMsg.sender_id === user?.id;
+        const myReaction = contextMsg.reactions.find((r) => r.user_id === user?.id);
+        const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+        return (
+          <div
+            className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 px-6"
+            style={{ backdropFilter: "blur(8px)", backgroundColor: "rgba(0,0,0,0.6)" }}
+            onClick={() => setContextMsg(null)}
+          >
+            {/* Frozen bubble */}
+            <div
+              className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm pointer-events-none ${
+                isOwn
+                  ? "bg-violet-600 text-white rounded-br-md self-end"
+                  : "bg-neutral-800 text-neutral-100 rounded-bl-md self-start"
+              }`}
+            >
+              <p>{contextMsg.content}</p>
+              <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
+                <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
+                  {new Date(contextMsg.sent_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                </span>
+              </div>
+            </div>
+
+            {/* Emoji strip */}
+            <div
+              className="flex items-center gap-2 bg-neutral-900 border border-neutral-700 rounded-full px-3 py-2 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {EMOJIS.map((emoji) => (
+                <button
+                  key={emoji}
+                  onClick={() => handleReact(contextMsg.id, emoji)}
+                  className={`text-2xl leading-none w-10 h-10 flex items-center justify-center rounded-full transition hover:scale-125 active:scale-110 ${
+                    myReaction?.emoji === emoji ? "bg-violet-600/30 ring-2 ring-violet-500 scale-110" : ""
+                  }`}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

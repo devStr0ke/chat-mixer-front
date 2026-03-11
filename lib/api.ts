@@ -130,12 +130,18 @@ export interface Room {
   is_active: boolean;
 }
 
+export interface Reaction {
+  user_id: string;
+  emoji: string;
+}
+
 export interface Message {
   id: string;
   sender_id: string;
   content: string;
   is_read: boolean;
   sent_at: string;
+  reactions: Reaction[];
 }
 
 export function getRoom(roomId: string) {
@@ -163,6 +169,19 @@ export function deleteRoom(roomId: string) {
   });
 }
 
+export function addReaction(messageId: string, emoji: string) {
+  return apiFetch<{ message: string }>(`/messages/${messageId}/reactions`, {
+    method: "POST",
+    body: JSON.stringify({ emoji }),
+  });
+}
+
+export function removeReaction(messageId: string) {
+  return apiFetch<{ message: string }>(`/messages/${messageId}/reactions`, {
+    method: "DELETE",
+  });
+}
+
 export type WsOutgoing =
   | { type: "message"; content: string }
   | { type: "typing" }
@@ -172,7 +191,9 @@ export type WsIncoming =
   | { type: "message"; id: string; content: string }
   | { type: "message_ack"; id: string }
   | { type: "typing" }
-  | { type: "read"; id: string };
+  | { type: "read"; id: string }
+  | { type: "reaction"; message_id: string; user_id: string; action: "add"; emoji: string }
+  | { type: "reaction"; message_id: string; user_id: string; action: "remove" };
 
 export type WsNotification =
   | { type: "new_message"; room_id: string; id: string }
