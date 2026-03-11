@@ -176,7 +176,8 @@ export type WsIncoming =
 
 export type WsNotification =
   | { type: "new_message"; room_id: string; id: string }
-  | { type: "room_closed"; room_id: string };
+  | { type: "room_closed"; room_id: string }
+  | { type: "online_count"; count: number };
 
 export function createChatWebSocket(roomId: string): WebSocket {
   const token = getToken();
