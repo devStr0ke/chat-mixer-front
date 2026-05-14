@@ -1,5 +1,26 @@
+packages:
+  - "./"
+
+# === Supply Chain Security ===
+
+# Block install scripts for packages that don't need them
+# (sharp & unrs-resolver compile natively, no build scripts needed)
 ignoredBuiltDependencies:
   - sharp
   - unrs-resolver
-packages:
-  - './'
+
+# Quarantine packages published less than 7 days ago
+minimumReleaseAge: 10080
+
+minimumReleaseAgeExclude:
+  - next
+  - react
+
+# Block exotic sources (git:, raw tarball URLs) in transitive deps
+blockExoticSubdeps: true
+
+allowBuilds:
+  esbuild: true
+  msw: true
+  sharp: true
+  unrs-resolver: true
