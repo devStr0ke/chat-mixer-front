@@ -5,6 +5,7 @@ interface AuthState {
   token: string | null;
   user: User | null;
   setAuth: (token: string, user: User) => void;
+  setUser: (user: User) => void;
   clearAuth: () => void;
   hydrate: () => void;
 }
@@ -29,6 +30,13 @@ export const useAuthStore = create<AuthState>()((set) => ({
       document.cookie = `token=${token}; path=/; max-age=${60 * 60 * 72}; SameSite=Lax`;
     }
     set({ token, user });
+  },
+
+  setUser: (user) => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("user", JSON.stringify(user));
+    }
+    set({ user });
   },
 
   clearAuth: () => {

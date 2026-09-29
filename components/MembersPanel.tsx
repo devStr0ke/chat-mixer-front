@@ -9,7 +9,8 @@ import {
   type Member,
   type RoomDetail,
 } from "@/lib/api";
-import { Flag } from "./Flag";
+import { Avatar } from "./Avatar";
+import { UserFlags } from "./UserFlags";
 import { UserPicker } from "./UserPicker";
 
 /**
@@ -127,9 +128,12 @@ export function MembersPanel({
                   const canCancel = isOwner || inv.inviter.id === currentUserId;
                   return (
                     <li key={inv.id} className="flex items-center gap-3 py-1.5">
-                      <Flag code={inv.invitee.country} />
+                      <Avatar user={inv.invitee} size={28} className="opacity-60" />
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm text-neutral-300 truncate">{inv.invitee.pseudo}</p>
+                        <p className="flex items-center gap-1.5 text-sm text-neutral-300">
+                          <span className="truncate">{inv.invitee.pseudo}</span>
+                          <UserFlags country={inv.invitee.country} country2={inv.invitee.country2} width={16} />
+                        </p>
                         <p className="text-[11px] text-neutral-500 truncate">
                           invited by {inv.inviter.id === currentUserId ? "you" : inv.inviter.pseudo}
                         </p>
@@ -154,10 +158,13 @@ export function MembersPanel({
             <ul className="space-y-1">
               {room.members.map((m) => (
                 <li key={m.id} className="flex items-center gap-3 py-1.5">
-                  <Flag code={m.country} />
-                  <p className="flex-1 min-w-0 text-sm text-neutral-200 truncate">
-                    {m.pseudo}
-                    {m.id === currentUserId && <span className="text-neutral-500"> (you)</span>}
+                  <Avatar user={m} size={28} />
+                  <p className="flex-1 min-w-0 flex items-center gap-1.5 text-sm text-neutral-200">
+                    <span className="truncate">
+                      {m.pseudo}
+                      {m.id === currentUserId && <span className="text-neutral-500"> (you)</span>}
+                    </span>
+                    <UserFlags country={m.country} country2={m.country2} width={16} />
                   </p>
                   {m.id === room.owner_id && (
                     <span className="text-[10px] font-semibold uppercase tracking-wider text-violet-300 bg-violet-600/20 border border-violet-500/30 rounded-full px-2 py-0.5">

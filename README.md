@@ -3,6 +3,7 @@
 Chat Mixer is a real-time group chat app. Users register with a pseudo and a country, create rooms, invite people by pseudo, and chat. Rooms are persistent — there's no expiry.
 
 **Features:**
+- Profile page: profile picture (center-cropped to a square in the browser) and an optional second country flag
 - Create rooms and invite people with a pseudo search
 - Accept or decline invitations, delivered live
 - Real-time messaging over WebSocket (JSON protocol) with paginated history

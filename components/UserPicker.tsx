@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { searchUsers, type UserSummary } from "@/lib/api";
-import { Flag } from "./Flag";
+import { Avatar } from "./Avatar";
+import { UserFlags } from "./UserFlags";
 
 const SEARCH_DEBOUNCE = 200;
 
@@ -115,8 +116,9 @@ export function UserPicker({
                     i === highlight ? "bg-neutral-700 text-white" : "text-neutral-200"
                   }`}
                 >
-                  <Flag code={u.country} />
-                  {u.pseudo}
+                  <Avatar user={u} size={24} />
+                  <span className="flex-1 truncate">{u.pseudo}</span>
+                  <UserFlags country={u.country} country2={u.country2} width={16} />
                 </button>
               </li>
             ))

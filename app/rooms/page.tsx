@@ -14,7 +14,9 @@ import {
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { formatShort } from "@/lib/format";
-import { Flag } from "@/components/Flag";
+import Link from "next/link";
+import { Avatar } from "@/components/Avatar";
+import { UserFlags } from "@/components/UserFlags";
 import { CreateRoomDialog } from "@/components/CreateRoomDialog";
 
 export default function RoomsPage() {
@@ -200,10 +202,15 @@ export default function RoomsPage() {
         </span>
         <div className="flex items-center gap-3">
           {user && (
-            <span className="flex items-center gap-2 text-sm text-neutral-400">
-              <Flag code={user.country} />
-              <span className="text-neutral-300 font-medium">{user.pseudo}</span>
-            </span>
+            <Link
+              href="/profile"
+              className="flex items-center gap-2 text-sm text-neutral-300 hover:text-white rounded-full pr-1 transition"
+              title="Edit your profile"
+            >
+              <Avatar user={user} size={28} />
+              <span className="font-medium">{user.pseudo}</span>
+              <UserFlags country={user.country} country2={user.country2} width={18} />
+            </Link>
           )}
           <button
             onClick={handleLogout}
@@ -253,8 +260,9 @@ export default function RoomsPage() {
                 >
                   <p className="text-sm text-neutral-300">
                     <span className="inline-flex items-center gap-1.5 align-middle">
-                      <Flag code={inv.inviter.country} width={16} />
+                      <Avatar user={inv.inviter} size={20} />
                       <span className="font-medium text-white">{inv.inviter.pseudo}</span>
+                      <UserFlags country={inv.inviter.country} country2={inv.inviter.country2} width={16} />
                     </span>{" "}
                     invited you to <span className="font-medium text-white">{inv.room_name}</span>
                   </p>

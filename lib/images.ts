@@ -33,3 +33,28 @@ export async function prepareImage(file: File): Promise<Blob> {
   const fallback = await canvasToBlob(canvas, file.type === "image/png" ? "image/png" : "image/jpeg", QUALITY);
   return fallback ?? file;
 }
+
+const AVATAR_SIZE = 256;
+
+/**
+ * Center-crops a picture to a 256px square for use as an avatar, stripping
+ * metadata along the way. GIFs are kept as-is so animated avatars still move.
+ */
+export async function prepareAvatar(file: File): Promise<Blob> {
+  if (file.type === "image/gif") return file;
+
+  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const side = Math.min(bitmap.width, bitmap.height);
+  const size = Math.min(AVATAR_SIZE, side);
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  canvas
+    .getContext("2d")
+    ?.drawImage(bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, size, size);
+  bitmap.close();
+
+  const webp = await canvasToBlob(canvas, "image/webp", QUALITY);
+  if (webp?.type === "image/webp") return webp;
+  return (await canvasToBlob(canvas, "image/png", QUALITY)) ?? file;
+}

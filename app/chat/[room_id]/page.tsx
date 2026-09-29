@@ -22,6 +22,7 @@ import {
 import { useAuthStore } from "@/lib/store";
 import { formatTime, formatDay, sameDay, nameColor } from "@/lib/format";
 import { MembersPanel } from "@/components/MembersPanel";
+import { Avatar } from "@/components/Avatar";
 import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentGrid";
 import { Lightbox } from "@/components/Lightbox";
 import { PendingUploads } from "@/components/PendingUploads";
@@ -630,6 +631,10 @@ export default function ChatPage() {
   const typingEntries = Object.entries(typingUsers);
   const typingNames = typingEntries.map(([, pseudo]) => pseudo);
 
+  function senderOf(msg: Pick<ChatMessage, "sender_id" | "sender_pseudo">) {
+    return memberById.get(msg.sender_id) ?? { id: msg.sender_id, pseudo: msg.sender_pseudo, avatar_id: null };
+  }
+
   function seenBy(msg: ChatMessage): Member[] {
     const sent = new Date(msg.sent_at).getTime();
     return otherMembers.filter((m) => new Date(m.last_read_at).getTime() >= sent);
@@ -853,6 +858,11 @@ export default function ChatPage() {
               )}
 
               <div className={`group flex ${isOwn ? "justify-end" : "justify-start"} ${showSender || newDay ? "mt-3" : "mt-1"}`}>
+                {!isOwn && (
+                  <div className="w-7 mr-2 flex-shrink-0">
+                    {showSender && <Avatar user={senderOf(msg)} size={28} />}
+                  </div>
+                )}
                 <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
                   {showSender && (
                     <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id)}`}>
@@ -1023,22 +1033,27 @@ export default function ChatPage() {
         })}
 
         {typingEntries.length > 0 && connState === "open" && (
-          <div className="flex flex-col items-start mt-3">
-            <span className="text-[11px] font-medium mb-0.5 ml-1">
-              {typingEntries.map(([id, pseudo], i) => (
-                <Fragment key={id}>
-                  {i > 0 && <span className="text-neutral-500">, </span>}
-                  <span className={nameColor(id)}>{pseudo}</span>
-                </Fragment>
-              ))}
-              <span className="text-neutral-500">
-                {typingEntries.length === 1 ? " is typing" : " are typing"}
+          <div className="flex mt-3">
+            <div className="w-7 mr-2 flex-shrink-0">
+              <Avatar user={senderOf({ sender_id: typingEntries[0][0], sender_pseudo: typingEntries[0][1] })} size={28} />
+            </div>
+            <div className="flex flex-col items-start">
+              <span className="text-[11px] font-medium mb-0.5 ml-1">
+                {typingEntries.map(([id, pseudo], i) => (
+                  <Fragment key={id}>
+                    {i > 0 && <span className="text-neutral-500">, </span>}
+                    <span className={nameColor(id)}>{pseudo}</span>
+                  </Fragment>
+                ))}
+                <span className="text-neutral-500">
+                  {typingEntries.length === 1 ? " is typing" : " are typing"}
+                </span>
               </span>
-            </span>
-            <div className="bg-neutral-800 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:0ms]" />
-              <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:150ms]" />
-              <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:300ms]" />
+              <div className="bg-neutral-800 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:0ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:150ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:300ms]" />
+              </div>
             </div>
           </div>
         )}

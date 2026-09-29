@@ -66,6 +66,8 @@ export interface User {
   pseudo: string;
   email: string;
   country: string;
+  country2: string | null;
+  avatar_id: string | null;
   created_at: string;
 }
 
@@ -78,6 +80,7 @@ export interface RegisterPayload {
   pseudo: string;
   email: string;
   country: string;
+  country2?: string;
   password: string;
 }
 
@@ -106,10 +109,40 @@ export interface UserSummary {
   id: string;
   pseudo: string;
   country: string;
+  country2: string | null;
+  avatar_id: string | null;
 }
 
 export function searchUsers(q: string) {
   return apiFetch<UserSummary[]>(`/users/search?q=${encodeURIComponent(q)}`);
+}
+
+export function getMe() {
+  return apiFetch<User>("/users/me");
+}
+
+export function updateProfile(country: string, country2: string | null) {
+  return apiFetch<User>("/users/me", {
+    method: "PATCH",
+    body: JSON.stringify({ country, country2 }),
+  });
+}
+
+export const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+
+export function uploadAvatar(file: Blob, filename: string) {
+  const form = new FormData();
+  form.append("file", file, filename);
+  return apiFetch<User>("/users/me/avatar", { method: "PUT", body: form });
+}
+
+export function deleteAvatar() {
+  return apiFetch<User>("/users/me/avatar", { method: "DELETE" });
+}
+
+/** Same-origin URL, so the browser sends the auth cookie with <img> requests. */
+export function avatarUrl(avatarId: string) {
+  return `${HTTP_BASE}/avatars/${avatarId}`;
 }
 
 export interface Room {

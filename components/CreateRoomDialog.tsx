@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createRoom, type UserSummary } from "@/lib/api";
-import { Flag } from "./Flag";
+import { Avatar } from "./Avatar";
 import { UserPicker } from "./UserPicker";
 
 export function CreateRoomDialog({
@@ -86,7 +86,7 @@ export function CreateRoomDialog({
                   key={u.id}
                   className="flex items-center gap-1.5 bg-neutral-800 border border-neutral-700 rounded-full pl-2 pr-1 py-1 text-xs text-neutral-200"
                 >
-                  <Flag code={u.country} width={16} />
+                  <Avatar user={u} size={16} />
                   {u.pseudo}
                   <button
                     type="button"
