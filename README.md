@@ -6,6 +6,7 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Create rooms and invite people with a pseudo search
 - Accept or decline invitations, delivered live
 - Real-time messaging over WebSocket (JSON protocol) with paginated history
+- Send images and GIFs: button, paste or drag-and-drop. Photos are resized to 2048px and stripped of EXIF (GPS) in the browser; GIFs stay animated
 - Typing indicators showing who is typing, and "seen by" read receipts
 - Emoji reactions: hover or right-click a message on desktop, long-press on mobile, double-click/tap for ❤️
 - Members panel: invite, cancel pending invitations, remove members (owner), leave

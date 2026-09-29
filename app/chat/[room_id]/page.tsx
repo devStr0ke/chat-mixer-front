@@ -11,6 +11,7 @@ import {
   removeMember,
   addReaction,
   removeReaction,
+  ACCEPTED_IMAGE_TYPES,
   type RoomDetail,
   type Member,
   type Message,
@@ -21,11 +22,19 @@ import {
 import { useAuthStore } from "@/lib/store";
 import { formatTime, formatDay, sameDay, nameColor } from "@/lib/format";
 import { MembersPanel } from "@/components/MembersPanel";
+import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentGrid";
+import { Lightbox } from "@/components/Lightbox";
+import { PendingUploads } from "@/components/PendingUploads";
+import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
 
 type ConnectionState = "connecting" | "open" | "closed";
 
 /** A message as shown locally: optimistic sends carry a client_id until acked. */
-type ChatMessage = Message & { client_id?: string; status?: "pending" | "failed" };
+type ChatMessage = Omit<Message, "attachments"> & {
+  attachments: DisplayAttachment[];
+  client_id?: string;
+  status?: "pending" | "failed";
+};
 
 const MAX_RECONNECTS = 10;
 const RECONNECT_DELAY = 2000;
@@ -78,6 +87,8 @@ export default function ChatPage() {
   const [contextMsg, setContextMsg] = useState<ChatMessage | null>(null);
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
+  const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -90,6 +101,12 @@ export default function ChatPage() {
   const lastTapRef = useRef<{ id: string; time: number } | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pointerTypeRef = useRef<string>("mouse");
+  // a long-press opens the reaction overlay; swallow the click that follows it
+  const holdFiredRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
+
+  const composer = useAttachmentUploads(room_id, setError);
   const messagesRef = useRef<ChatMessage[]>([]);
   const nearBottomRef = useRef(true);
   const scrollModeRef = useRef<"none" | "bottom" | "restore">("none");
@@ -214,9 +231,10 @@ export default function ChatPage() {
               id: incoming.id,
               sender_id: incoming.sender_id,
               sender_pseudo: incoming.sender_pseudo,
-              content: incoming.content,
+              content: incoming.content ?? "",
               sent_at: incoming.sent_at,
               reactions: [],
+              attachments: incoming.attachments ?? [],
             };
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
@@ -395,11 +413,16 @@ export default function ChatPage() {
     }
   }
 
-  function sendContent(text: string) {
+  function sendContent(text: string, attachments: DisplayAttachment[] = []) {
     if (!user) return;
     localIdRef.current += 1;
     const clientId = `local-${Date.now()}-${localIdRef.current}`;
-    wsSend({ type: "message", content: text, client_id: clientId });
+    wsSend({
+      type: "message",
+      content: text,
+      client_id: clientId,
+      ...(attachments.length > 0 && { attachment_ids: attachments.map((a) => a.id) }),
+    });
     const localMsg: ChatMessage = {
       id: clientId,
       client_id: clientId,
@@ -409,6 +432,7 @@ export default function ChatPage() {
       content: text,
       sent_at: new Date().toISOString(),
       reactions: [],
+      attachments,
     };
     scrollModeRef.current = "bottom";
     setMessages((prev) => [...prev, localMsg]);
@@ -417,8 +441,9 @@ export default function ChatPage() {
   function handleSend(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const text = input.trim();
-    if (!text || wsRef.current?.readyState !== WebSocket.OPEN) return;
-    sendContent(text);
+    if (composer.blocked || (!text && composer.ready === 0)) return;
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    sendContent(text, composer.take());
     setInput("");
     lastTypingSentRef.current = 0;
     inputRef.current?.focus();
@@ -427,7 +452,46 @@ export default function ChatPage() {
   function handleRetry(msg: ChatMessage) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-    sendContent(msg.content);
+    sendContent(msg.content, msg.attachments);
+  }
+
+  function imageFiles(list: FileList | null | undefined): File[] {
+    return Array.from(list ?? []).filter((f) => f.type.startsWith("image/"));
+  }
+
+  function handlePaste(e: React.ClipboardEvent<HTMLInputElement>) {
+    const files = imageFiles(e.clipboardData.files);
+    if (files.length === 0) return;
+    e.preventDefault();
+    composer.addFiles(files);
+  }
+
+  function handleDragEnter(e: React.DragEvent) {
+    if (removed || !e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragging(true);
+  }
+
+  function handleDragLeave() {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragging(false);
+    if (removed) return;
+    composer.addFiles(Array.from(e.dataTransfer.files));
+  }
+
+  function openLightbox(msg: ChatMessage, index: number) {
+    if (holdFiredRef.current) {
+      holdFiredRef.current = false;
+      return;
+    }
+    setLightbox({ items: msg.attachments, index });
   }
 
   function handleInputChange(value: string) {
@@ -447,6 +511,13 @@ export default function ChatPage() {
         return { ...m, reactions: reaction ? [...others, reaction] : others };
       })
     );
+  }
+
+  function cancelHold() {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
   }
 
   function togglePicker(messageId: string, anchor: Element) {
@@ -568,7 +639,13 @@ export default function ChatPage() {
   const lastOwnSeenBy = lastOwnSent ? seenBy(lastOwnSent) : [];
 
   return (
-    <div className="h-dvh bg-neutral-950 flex flex-col">
+    <div
+      className="relative h-dvh bg-neutral-950 flex flex-col"
+      onDragEnter={handleDragEnter}
+      onDragOver={(e) => dragging && e.preventDefault()}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <header className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800 flex-shrink-0">
         <div className="flex items-center gap-3 min-w-0">
           <button
@@ -763,6 +840,7 @@ export default function ChatPage() {
           const seen = isOwn && confirmed ? seenBy(msg) : [];
           const seenByAll = otherMembers.length > 0 && seen.length === otherMembers.length;
           const reactionGroups = groupReactions(msg.reactions, user.id);
+          const hasAttachments = msg.attachments.length > 0;
 
           return (
             <div key={msg.client_id ?? msg.id}>
@@ -783,7 +861,9 @@ export default function ChatPage() {
                   )}
                   <div className="relative">
                     <div
-                      className={`rounded-2xl px-4 py-2 text-sm break-words select-none touch-none ${
+                      className={`rounded-2xl text-sm break-words select-none touch-manipulation ${
+                        hasAttachments ? "p-1" : "px-4 py-2"
+                      } ${
                         isOwn
                           ? `bg-violet-600 text-white rounded-br-md ${msg.status === "failed" ? "opacity-60" : ""}`
                           : "bg-neutral-800 text-neutral-100 rounded-bl-md"
@@ -792,8 +872,10 @@ export default function ChatPage() {
                         e.stopPropagation();
                         pointerTypeRef.current = e.pointerType;
                         if (!confirmed) return;
+                        holdFiredRef.current = false;
                         holdTimerRef.current = setTimeout(() => {
                           holdTimerRef.current = null;
+                          holdFiredRef.current = true;
                           lastTapRef.current = null;
                           setContextMsg(msg);
                         }, 400);
@@ -814,12 +896,8 @@ export default function ChatPage() {
                           }
                         }
                       }}
-                      onPointerLeave={() => {
-                        if (holdTimerRef.current) {
-                          clearTimeout(holdTimerRef.current);
-                          holdTimerRef.current = null;
-                        }
-                      }}
+                      onPointerLeave={cancelHold}
+                      onPointerCancel={cancelHold}
                       onContextMenu={(e) => {
                         e.preventDefault();
                         // touch long-press is handled by the hold timer overlay
@@ -827,8 +905,17 @@ export default function ChatPage() {
                         togglePicker(msg.id, e.currentTarget);
                       }}
                     >
-                      <p className="whitespace-pre-wrap">{msg.content}</p>
-                      <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
+                      {hasAttachments && (
+                        <AttachmentGrid attachments={msg.attachments} onOpen={(i) => openLightbox(msg, i)} />
+                      )}
+                      {msg.content && (
+                        <p className={`whitespace-pre-wrap ${hasAttachments ? "px-3 pt-1.5" : ""}`}>{msg.content}</p>
+                      )}
+                      <div
+                        className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""} ${
+                          hasAttachments ? "px-3 pb-1" : ""
+                        }`}
+                      >
                         <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
                           {formatTime(msg.sent_at)}
                         </span>
@@ -970,32 +1057,67 @@ export default function ChatPage() {
           </button>
         </div>
       ) : (
-        <form
-          onSubmit={handleSend}
-          className="border-t border-neutral-800 px-4 py-3 flex items-center gap-3 flex-shrink-0"
-        >
-          <input
-            ref={inputRef}
-            type="text"
-            value={input}
-            onChange={(e) => handleInputChange(e.target.value)}
-            placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
-            disabled={connState !== "open"}
-            maxLength={2000}
-            autoFocus
-            className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
-          />
-          <button
-            type="submit"
-            disabled={connState !== "open" || !input.trim()}
-            className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
-            aria-label="Send"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
-            </svg>
-          </button>
+        <form onSubmit={handleSend} className="border-t border-neutral-800 flex-shrink-0">
+          <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
+          <div className="px-4 py-3 flex items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={ACCEPTED_IMAGE_TYPES.join(",")}
+              multiple
+              hidden
+              onChange={(e) => {
+                composer.addFiles(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2.5 transition"
+              aria-label="Add images"
+              title="Add images (or paste / drop them)"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
+                <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={2} />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 15l-5-5L5 20" />
+              </svg>
+            </button>
+            <input
+              ref={inputRef}
+              type="text"
+              value={input}
+              onPaste={handlePaste}
+              onChange={(e) => handleInputChange(e.target.value)}
+              placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
+              disabled={connState !== "open"}
+              maxLength={2000}
+              autoFocus
+              className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0)}
+              className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
+              aria-label="Send"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </button>
+          </div>
         </form>
+      )}
+
+      {lightbox && (
+        <Lightbox attachments={lightbox.items} index={lightbox.index} onClose={() => setLightbox(null)} />
+      )}
+
+      {dragging && (
+        <div className="pointer-events-none absolute inset-0 z-40 m-3 flex items-center justify-center rounded-2xl border-2 border-dashed border-violet-500 bg-neutral-950/80">
+          <p className="text-sm font-medium text-violet-300">Drop images to send</p>
+        </div>
       )}
 
       {showMembers && (
@@ -1032,7 +1154,10 @@ export default function ChatPage() {
                   {contextMsg.sender_pseudo}
                 </p>
               )}
-              <p className="whitespace-pre-wrap">{contextMsg.content}</p>
+              <p className="whitespace-pre-wrap">
+                {contextMsg.content ||
+                  (contextMsg.attachments.length > 1 ? `📷 ${contextMsg.attachments.length} photos` : "📷 Photo")}
+              </p>
               <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
                 <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
                   {formatTime(contextMsg.sent_at)}

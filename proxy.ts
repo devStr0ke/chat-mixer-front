@@ -31,5 +31,7 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  // /api is excluded so upload bodies stream straight to the rewrite instead
+  // of being buffered by the proxy (which caps request bodies at 10 MB)
+  matcher: ["/((?!api/|_next/static|_next/image|favicon.ico).*)"],
 };

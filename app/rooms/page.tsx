@@ -105,7 +105,8 @@ export default function RoomsPage() {
                     id: msg.id,
                     sender_id: msg.sender_id,
                     sender_pseudo: msg.sender_pseudo,
-                    content: msg.content,
+                    content: msg.content ?? "",
+                    attachment_count: msg.attachments?.length ?? 0,
                     sent_at: msg.sent_at,
                   },
                 };
@@ -186,7 +187,9 @@ export default function RoomsPage() {
         : `No messages yet · ${room.member_count} members`;
     }
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
-    return `${who}: ${last.content}`;
+    const photos =
+      last.attachment_count > 1 ? `📷 ${last.attachment_count} photos` : last.attachment_count === 1 ? "📷 Photo" : "";
+    return `${who}: ${last.content || photos}`;
   }
 
   return (

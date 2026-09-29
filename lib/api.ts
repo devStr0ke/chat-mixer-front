@@ -17,8 +17,9 @@ export async function apiFetch<T = unknown>(
 ): Promise<T> {
   const { skipAuth = false, headers = {}, ...rest } = options;
 
+  // FormData bodies need the browser to set the multipart boundary itself
   const mergedHeaders: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(rest.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
     ...headers,
   };
 
@@ -123,6 +124,7 @@ export interface LastMessage {
   sender_id: string;
   sender_pseudo: string;
   content: string;
+  attachment_count: number;
   sent_at: string;
 }
 
@@ -146,6 +148,14 @@ export interface Reaction {
   emoji: string;
 }
 
+export interface Attachment {
+  id: string;
+  content_type: string;
+  width: number;
+  height: number;
+  size: number;
+}
+
 export interface Message {
   id: string;
   sender_id: string;
@@ -153,6 +163,7 @@ export interface Message {
   content: string;
   sent_at: string;
   reactions: Reaction[];
+  attachments: Attachment[];
 }
 
 export interface MessagePage {
@@ -237,6 +248,24 @@ export function deleteInvitation(invitationId: string) {
   });
 }
 
+export const ACCEPTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+
+export function uploadAttachment(roomId: string, file: Blob, filename: string) {
+  const form = new FormData();
+  form.append("file", file, filename);
+  return apiFetch<Attachment>(`/rooms/${roomId}/attachments`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+/** Same-origin URL, so the browser sends the auth cookie with <img> requests. */
+export function attachmentUrl(attachmentId: string) {
+  return `${HTTP_BASE}/attachments/${attachmentId}`;
+}
+
 export function addReaction(messageId: string, emoji: string) {
   return apiFetch<{ message: string }>(`/messages/${messageId}/reactions`, {
     method: "POST",
@@ -251,7 +280,7 @@ export function removeReaction(messageId: string) {
 }
 
 export type WsOutgoing =
-  | { type: "message"; content: string; client_id: string }
+  | { type: "message"; content: string; client_id: string; attachment_ids?: string[] }
   | { type: "typing" }
   | { type: "read"; id: string };
 
@@ -262,8 +291,9 @@ export type WsIncoming =
       room_id: string;
       sender_id: string;
       sender_pseudo: string;
-      content: string;
+      content?: string;
       sent_at: string;
+      attachments?: Attachment[];
     }
   | { type: "message_ack"; id: string; client_id: string; sent_at: string }
   | { type: "message_error"; client_id: string }
@@ -282,8 +312,9 @@ export type WsNotification =
       room_id: string;
       sender_id: string;
       sender_pseudo: string;
-      content: string;
+      content?: string;
       sent_at: string;
+      attachments?: Attachment[];
     }
   | { type: "invitation"; room_id: string }
   | { type: "room_removed"; room_id: string }
