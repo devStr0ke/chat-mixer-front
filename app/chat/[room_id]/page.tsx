@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import { Fragment, useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   getRoom,
@@ -76,6 +76,8 @@ export default function ChatPage() {
   const [showMembers, setShowMembers] = useState(false);
   const [roomVersion, setRoomVersion] = useState(0);
   const [contextMsg, setContextMsg] = useState<ChatMessage | null>(null);
+  // desktop reaction picker, anchored to a message; opens below when near the top of the list
+  const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -87,6 +89,7 @@ export default function ChatPage() {
   const removedRef = useRef(false);
   const lastTapRef = useRef<{ id: string; time: number } | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pointerTypeRef = useRef<string>("mouse");
   const messagesRef = useRef<ChatMessage[]>([]);
   const nearBottomRef = useRef(true);
   const scrollModeRef = useRef<"none" | "bottom" | "restore">("none");
@@ -328,6 +331,22 @@ export default function ChatPage() {
     messagesRef.current = messages;
   }, [messages]);
 
+  useEffect(() => {
+    if (!picker) return;
+    function handleMouseDown(e: MouseEvent) {
+      if (!(e.target as Element).closest("[data-reaction-picker]")) setPicker(null);
+    }
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setPicker(null);
+    }
+    document.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [picker]);
+
   const typingCount = Object.keys(typingUsers).length;
 
   // Keep the view pinned: jump to the bottom on load/send, follow new messages
@@ -430,8 +449,21 @@ export default function ChatPage() {
     );
   }
 
+  function togglePicker(messageId: string, anchor: Element) {
+    if (picker?.id === messageId) {
+      setPicker(null);
+      return;
+    }
+    const container = scrollRef.current;
+    const below = container
+      ? anchor.getBoundingClientRect().top - container.getBoundingClientRect().top < 56
+      : false;
+    setPicker({ id: messageId, below });
+  }
+
   async function handleReact(messageId: string, emoji: string) {
     setContextMsg(null);
+    setPicker(null);
     if (!userId) return;
     const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === userId);
     if (existing?.emoji === emoji) {
@@ -524,7 +556,8 @@ export default function ChatPage() {
   const isOwner = room.owner_id === user.id;
   const otherMembers = room.members.filter((m) => m.id !== user.id);
   const memberById = new Map(room.members.map((m) => [m.id, m]));
-  const typingNames = Object.values(typingUsers);
+  const typingEntries = Object.entries(typingUsers);
+  const typingNames = typingEntries.map(([, pseudo]) => pseudo);
 
   function seenBy(msg: ChatMessage): Member[] {
     const sent = new Date(msg.sent_at).getTime();
@@ -741,77 +774,121 @@ export default function ChatPage() {
                 </div>
               )}
 
-              <div className={`flex ${isOwn ? "justify-end" : "justify-start"} ${showSender || newDay ? "mt-3" : "mt-1"}`}>
+              <div className={`group flex ${isOwn ? "justify-end" : "justify-start"} ${showSender || newDay ? "mt-3" : "mt-1"}`}>
                 <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
                   {showSender && (
                     <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id)}`}>
                       {msg.sender_pseudo}
                     </span>
                   )}
-                  <div
-                    className={`rounded-2xl px-4 py-2 text-sm break-words select-none touch-none ${
-                      isOwn
-                        ? `bg-violet-600 text-white rounded-br-md ${msg.status === "failed" ? "opacity-60" : ""}`
-                        : "bg-neutral-800 text-neutral-100 rounded-bl-md"
-                    }`}
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      if (!confirmed) return;
-                      holdTimerRef.current = setTimeout(() => {
-                        holdTimerRef.current = null;
-                        lastTapRef.current = null;
-                        setContextMsg(msg);
-                      }, 400);
-                    }}
-                    onPointerUp={(e) => {
-                      e.stopPropagation();
-                      if (!confirmed) return;
-                      if (holdTimerRef.current) {
-                        clearTimeout(holdTimerRef.current);
-                        holdTimerRef.current = null;
-                        const now = Date.now();
-                        const last = lastTapRef.current;
-                        if (last?.id === msg.id && now - last.time < 300) {
+                  <div className="relative">
+                    <div
+                      className={`rounded-2xl px-4 py-2 text-sm break-words select-none touch-none ${
+                        isOwn
+                          ? `bg-violet-600 text-white rounded-br-md ${msg.status === "failed" ? "opacity-60" : ""}`
+                          : "bg-neutral-800 text-neutral-100 rounded-bl-md"
+                      }`}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        pointerTypeRef.current = e.pointerType;
+                        if (!confirmed) return;
+                        holdTimerRef.current = setTimeout(() => {
+                          holdTimerRef.current = null;
                           lastTapRef.current = null;
-                          handleReact(msg.id, "❤️");
-                        } else {
-                          lastTapRef.current = { id: msg.id, time: now };
+                          setContextMsg(msg);
+                        }, 400);
+                      }}
+                      onPointerUp={(e) => {
+                        e.stopPropagation();
+                        if (!confirmed) return;
+                        if (holdTimerRef.current) {
+                          clearTimeout(holdTimerRef.current);
+                          holdTimerRef.current = null;
+                          const now = Date.now();
+                          const last = lastTapRef.current;
+                          if (last?.id === msg.id && now - last.time < 300) {
+                            lastTapRef.current = null;
+                            handleReact(msg.id, "❤️");
+                          } else {
+                            lastTapRef.current = { id: msg.id, time: now };
+                          }
                         }
-                      }
-                    }}
-                    onPointerLeave={() => {
-                      if (holdTimerRef.current) {
-                        clearTimeout(holdTimerRef.current);
-                        holdTimerRef.current = null;
-                      }
-                    }}
-                  >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
-                    <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
-                      <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
-                        {formatTime(msg.sent_at)}
-                      </span>
-                      {isOwn && confirmed && (
-                        <svg
-                          className={`w-3.5 h-3.5 ${seenByAll ? "text-violet-200" : "text-violet-400/60"}`}
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          {seenByAll ? (
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
-                          ) : (
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
-                          )}
-                        </svg>
-                      )}
-                      {msg.status === "pending" && (
-                        <svg className="w-3 h-3 text-violet-300/70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                          <path strokeLinecap="round" strokeWidth={2} d="M12 7v5l3 2" />
-                        </svg>
-                      )}
+                      }}
+                      onPointerLeave={() => {
+                        if (holdTimerRef.current) {
+                          clearTimeout(holdTimerRef.current);
+                          holdTimerRef.current = null;
+                        }
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        // touch long-press is handled by the hold timer overlay
+                        if (!confirmed || pointerTypeRef.current === "touch") return;
+                        togglePicker(msg.id, e.currentTarget);
+                      }}
+                    >
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                      <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
+                        <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
+                          {formatTime(msg.sent_at)}
+                        </span>
+                        {isOwn && confirmed && (
+                          <svg
+                            className={`w-3.5 h-3.5 ${seenByAll ? "text-violet-200" : "text-violet-400/60"}`}
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            {seenByAll ? (
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
+                            ) : (
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
+                            )}
+                          </svg>
+                        )}
+                        {msg.status === "pending" && (
+                          <svg className="w-3 h-3 text-violet-300/70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                            <path strokeLinecap="round" strokeWidth={2} d="M12 7v5l3 2" />
+                          </svg>
+                        )}
+                      </div>
                     </div>
+
+                    {confirmed && (
+                      <button
+                        type="button"
+                        data-reaction-picker
+                        onClick={(e) => togglePicker(msg.id, e.currentTarget)}
+                        title="Add reaction (or double-click the message for ❤️)"
+                        aria-label="Add reaction"
+                        className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 ${
+                          isOwn ? "right-full mr-1.5" : "left-full ml-1.5"
+                        } w-7 h-7 items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition focus-visible:opacity-100 ${
+                          picker?.id === msg.id ? "opacity-100 text-neutral-200 bg-neutral-800" : "opacity-0 group-hover:opacity-100"
+                        }`}
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                          <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
+                        </svg>
+                      </button>
+                    )}
+
+                    {picker?.id === msg.id && (
+                      <div
+                        data-reaction-picker
+                        className={`absolute z-30 ${picker.below ? "top-full mt-1.5" : "bottom-full mb-1.5"} ${
+                          isOwn ? "right-0" : "left-0"
+                        }`}
+                      >
+                        <ReactionBar
+                          selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
+                          onPick={(emoji) => handleReact(msg.id, emoji)}
+                          compact
+                        />
+                      </div>
+                    )}
                   </div>
 
                   {msg.status === "failed" && (
@@ -858,8 +935,19 @@ export default function ChatPage() {
           );
         })}
 
-        {typingNames.length > 0 && connState === "open" && (
-          <div className="flex justify-start mt-3">
+        {typingEntries.length > 0 && connState === "open" && (
+          <div className="flex flex-col items-start mt-3">
+            <span className="text-[11px] font-medium mb-0.5 ml-1">
+              {typingEntries.map(([id, pseudo], i) => (
+                <Fragment key={id}>
+                  {i > 0 && <span className="text-neutral-500">, </span>}
+                  <span className={nameColor(id)}>{pseudo}</span>
+                </Fragment>
+              ))}
+              <span className="text-neutral-500">
+                {typingEntries.length === 1 ? " is typing" : " are typing"}
+              </span>
+            </span>
             <div className="bg-neutral-800 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:0ms]" />
               <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:150ms]" />
@@ -953,25 +1041,46 @@ export default function ChatPage() {
             </div>
 
             {/* Emoji strip */}
-            <div
-              className="flex items-center gap-2 bg-neutral-900 border border-neutral-700 rounded-full px-3 py-2 shadow-2xl"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {EMOJIS.map((emoji) => (
-                <button
-                  key={emoji}
-                  onClick={() => handleReact(contextMsg.id, emoji)}
-                  className={`text-2xl leading-none w-10 h-10 flex items-center justify-center rounded-full transition hover:scale-125 active:scale-110 ${
-                    myReaction?.emoji === emoji ? "bg-violet-600/30 ring-2 ring-violet-500 scale-110" : ""
-                  }`}
-                >
-                  {emoji}
-                </button>
-              ))}
+            <div onClick={(e) => e.stopPropagation()}>
+              <ReactionBar
+                selected={myReaction?.emoji}
+                onPick={(emoji) => handleReact(contextMsg.id, emoji)}
+              />
             </div>
           </div>
         );
       })()}
+    </div>
+  );
+}
+
+function ReactionBar({
+  selected,
+  onPick,
+  compact = false,
+}: {
+  selected?: string;
+  onPick: (emoji: string) => void;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={`flex items-center bg-neutral-900 border border-neutral-700 rounded-full shadow-2xl ${
+        compact ? "gap-0.5 px-1.5 py-1" : "gap-2 px-3 py-2"
+      }`}
+    >
+      {EMOJIS.map((emoji) => (
+        <button
+          key={emoji}
+          type="button"
+          onClick={() => onPick(emoji)}
+          className={`leading-none flex items-center justify-center rounded-full transition hover:scale-125 active:scale-110 ${
+            compact ? "text-xl w-9 h-9 hover:bg-neutral-800" : "text-2xl w-10 h-10"
+          } ${selected === emoji ? "bg-violet-600/30 ring-2 ring-violet-500 scale-110" : ""}`}
+        >
+          {emoji}
+        </button>
+      ))}
     </div>
   );
 }
