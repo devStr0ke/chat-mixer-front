@@ -1,13 +1,15 @@
 # Chat Mixer — Frontend
 
-Chat Mixer is an anonymous, ephemeral real-time chat app. Users register with a pseudo and a country, then get matched with a random stranger for a 24-hour conversation window. Each conversation is isolated —> no history is kept after expiry.
+Chat Mixer is a real-time group chat app. Users register with a pseudo and a country, create rooms, invite people by pseudo, and chat. Rooms are persistent — there's no expiry.
 
 **Features:**
-- Anonymous matchmaking (worldwide or same-country)
-- Real-time messaging over WebSocket (JSON protocol)
-- Typing indicators and read receipts
-- Room rename and delete
-- Instant unread badge updates via a global notification WebSocket
+- Create rooms and invite people with a pseudo search
+- Accept or decline invitations, delivered live
+- Real-time messaging over WebSocket (JSON protocol) with paginated history
+- Typing indicators, "seen by" read receipts and emoji reactions
+- Members panel: invite, cancel pending invitations, remove members (owner), leave
+- Rename and delete rooms (owner)
+- Live unread badges and message previews via a global notification WebSocket
 - JWT authentication with automatic expiry handling
 
 ---
@@ -26,13 +28,13 @@ Create a `.env.local` file at the root of the project:
 
 ```bash
 # Base URL of the Chat Mixer backend (used for HTTP API calls and WS host fallback)
-NEXT_PUBLIC_API_URL=http://localhost:8080
+NEXT_PUBLIC_API_URL=http://localhost:8090
 
 # Optional — only needed for LAN testing between two devices on the same network.
 # When set, all WebSocket connections (chat + notifications) will use this host instead
 # of the host extracted from NEXT_PUBLIC_API_URL.
 # Format: host:port (no protocol prefix)
-# NEXT_PUBLIC_WS_HOST=192.168.1.12:8080
+# NEXT_PUBLIC_WS_HOST=192.168.1.12:8090
 ```
 
 > **Note:** After modifying `.env.local`, restart the dev server for changes to take effect.
@@ -46,7 +48,7 @@ pnpm install
 pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+Open [http://localhost:3000](http://localhost:3000) in your browser. If port 3000 is taken, use `pnpm dev --port 3001`.
 
 ---
 

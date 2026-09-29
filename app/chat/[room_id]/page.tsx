@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   getRoom,
@@ -8,60 +8,89 @@ import {
   createChatWebSocket,
   deleteRoom,
   renameRoom,
+  removeMember,
   addReaction,
   removeReaction,
-  type Room,
+  type RoomDetail,
+  type Member,
   type Message,
   type Reaction,
   type WsOutgoing,
   type WsIncoming,
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
-import { flagUrl } from "@/lib/countries";
+import { formatTime, formatDay, sameDay, nameColor } from "@/lib/format";
+import { MembersPanel } from "@/components/MembersPanel";
 
 type ConnectionState = "connecting" | "open" | "closed";
+
+/** A message as shown locally: optimistic sends carry a client_id until acked. */
+type ChatMessage = Message & { client_id?: string; status?: "pending" | "failed" };
 
 const MAX_RECONNECTS = 10;
 const RECONNECT_DELAY = 2000;
 const TYPING_THROTTLE = 3000;
 const TYPING_TIMEOUT = 4000;
+const LOAD_OLDER_THRESHOLD = 80;
+const NEAR_BOTTOM = 120;
+const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+
+function isStatus(err: unknown, status: number): boolean {
+  return (err as { status?: number } | null)?.status === status;
+}
+
+/** Merges fetched messages into the local list by id, keeping chronological order. */
+function mergeMessages(local: ChatMessage[], fetched: Message[]): ChatMessage[] {
+  const known = new Set(local.map((m) => m.id));
+  const added = fetched.filter((m) => !known.has(m.id));
+  if (added.length === 0) return local;
+  return [...local, ...added].sort(
+    (a, b) => new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime()
+  );
+}
+
+function typingLabel(names: string[]): string {
+  if (names.length === 1) return `${names[0]} is typing…`;
+  if (names.length === 2) return `${names[0]} and ${names[1]} are typing…`;
+  return "Several people are typing…";
+}
 
 export default function ChatPage() {
   const { room_id } = useParams<{ room_id: string }>();
   const router = useRouter();
   const user = useAuthStore((s) => s.user);
+  const userId = user?.id;
 
-  const [room, setRoom] = useState<Room | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [room, setRoom] = useState<RoomDetail | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [input, setInput] = useState("");
   const [connState, setConnState] = useState<ConnectionState>("connecting");
-  const [expired, setExpired] = useState(false);
-  const [deleted, setDeleted] = useState(false);
-  const [remaining, setRemaining] = useState("");
+  const [removed, setRemoved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [partnerTyping, setPartnerTyping] = useState(false);
+  const [typingUsers, setTypingUsers] = useState<Record<string, string>>({});
   const [showMenu, setShowMenu] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [showRename, setShowRename] = useState(false);
-  const [contextMsg, setContextMsg] = useState<Message | null>(null);
+  const [showMembers, setShowMembers] = useState(false);
+  const [roomVersion, setRoomVersion] = useState(0);
+  const [contextMsg, setContextMsg] = useState<ChatMessage | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const reconnectCountRef = useRef(0);
   const localIdRef = useRef(0);
   const lastTypingSentRef = useRef(0);
-  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const deletedRef = useRef(false);
-  const pendingAckQueue = useRef<string[]>([]);
+  const typingTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const removedRef = useRef(false);
   const lastTapRef = useRef<{ id: string; time: number } | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const messagesRef = useRef<Message[]>([]);
-
-  const scrollToBottom = useCallback(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, []);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const nearBottomRef = useRef(true);
+  const scrollModeRef = useRef<"none" | "bottom" | "restore">("none");
+  const restoreRef = useRef({ height: 0, top: 0 });
 
   function wsSend(payload: WsOutgoing) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -69,35 +98,83 @@ export default function ChatPage() {
     }
   }
 
+  const markRemoved = useCallback(() => {
+    removedRef.current = true;
+    setRemoved(true);
+    setConnState("closed");
+    setShowMembers(false);
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+  }, []);
+
+  const refreshRoom = useCallback(async () => {
+    try {
+      setRoom(await getRoom(room_id));
+      setRoomVersion((v) => v + 1);
+    } catch (err) {
+      if (isStatus(err, 404)) markRemoved();
+    }
+  }, [room_id, markRemoved]);
+
+  const clearTyping = useCallback((id: string) => {
+    clearTimeout(typingTimersRef.current[id]);
+    delete typingTimersRef.current[id];
+    setTypingUsers((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
+    if (!userId) return;
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    const typingTimers = typingTimersRef.current;
 
     async function init() {
       try {
-        const [roomData, history] = await Promise.all([
-          getRoom(room_id),
-          getRoomMessages(room_id),
-        ]);
+        const [roomData, page] = await Promise.all([getRoom(room_id), getRoomMessages(room_id)]);
         if (cancelled) return;
 
         setRoom(roomData);
-        setMessages(history ?? []);
-        messagesRef.current = history ?? [];
+        scrollModeRef.current = "bottom";
+        setMessages(page.messages);
+        messagesRef.current = page.messages;
+        setHasMore(page.has_more);
 
-        if (!roomData.is_active || new Date(roomData.expires_at).getTime() <= Date.now()) {
-          setExpired(true);
-          setConnState("closed");
-          return;
-        }
-
-        reconnectTimer = setTimeout(connectWs, 500);
+        reconnectTimer = setTimeout(connectWs, 300);
       } catch (err) {
-        if (!cancelled) {
+        if (cancelled) return;
+        if (isStatus(err, 404)) {
+          setError("This room doesn't exist or you're not a member.");
+        } else {
           setError(err instanceof Error ? err.message : "Failed to load room.");
-          setConnState("closed");
         }
+        setConnState("closed");
       }
+    }
+
+    function markLatestRead(ws: WebSocket) {
+      const latest = messagesRef.current.findLast((m) => !m.status);
+      if (latest && latest.sender_id !== userId) {
+        ws.send(JSON.stringify({ type: "read", id: latest.id }));
+      }
+    }
+
+    // After a reconnect, pick up whatever was sent while we were away.
+    async function catchUp(ws: WebSocket) {
+      try {
+        const page = await getRoomMessages(room_id);
+        if (cancelled) return;
+        setMessages((prev) => mergeMessages(prev, page.messages));
+        messagesRef.current = mergeMessages(messagesRef.current, page.messages);
+        refreshRoom();
+        if (ws.readyState === WebSocket.OPEN) markLatestRead(ws);
+      } catch { /* the close handler deals with lost access */ }
     }
 
     function connectWs() {
@@ -109,21 +186,13 @@ export default function ChatPage() {
 
       ws.addEventListener("open", () => {
         if (cancelled) return;
+        const isReconnect = reconnectCountRef.current > 0;
         reconnectCountRef.current = 0;
         setConnState("open");
-
-        const unread = messagesRef.current.filter(
-          (m) => m.sender_id !== user?.id && !m.is_read
-        );
-        unread.forEach((m) => {
-          ws.send(JSON.stringify({ type: "read", id: m.id }));
-        });
-        if (unread.length > 0) {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.sender_id !== user?.id && !m.is_read ? { ...m, is_read: true } : m
-            )
-          );
+        if (isReconnect) {
+          catchUp(ws);
+        } else {
+          markLatestRead(ws);
         }
       });
 
@@ -136,52 +205,76 @@ export default function ChatPage() {
           return;
         }
 
-        if (incoming.type === "message") {
-          const msg: Message = {
-            id: incoming.id,
-            sender_id: "partner",
-            content: incoming.content,
-            is_read: false,
-            sent_at: new Date().toISOString(),
-            reactions: [],
-          };
-          setMessages((prev) => [...prev, msg]);
-          setPartnerTyping(false);
-          wsSend({ type: "read", id: incoming.id });
-        }
-
-        if (incoming.type === "message_ack") {
-          const localId = pendingAckQueue.current.shift();
-          if (localId) {
-            setMessages((prev) =>
-              prev.map((m) => (m.id === localId ? { ...m, id: incoming.id } : m))
-            );
+        switch (incoming.type) {
+          case "message": {
+            const msg: ChatMessage = {
+              id: incoming.id,
+              sender_id: incoming.sender_id,
+              sender_pseudo: incoming.sender_pseudo,
+              content: incoming.content,
+              sent_at: incoming.sent_at,
+              reactions: [],
+            };
+            setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
+            clearTyping(incoming.sender_id);
+            if (incoming.sender_id !== userId) {
+              wsSend({ type: "read", id: incoming.id });
+            }
+            break;
           }
-        }
 
-        if (incoming.type === "typing") {
-          setPartnerTyping(true);
-          if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-          typingTimeoutRef.current = setTimeout(() => setPartnerTyping(false), TYPING_TIMEOUT);
-        }
+          case "message_ack":
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.client_id === incoming.client_id
+                  ? { ...m, id: incoming.id, sent_at: incoming.sent_at, status: undefined }
+                  : m
+              )
+            );
+            break;
 
-        if (incoming.type === "read") {
-          setMessages((prev) =>
-            prev.map((m) => (m.id === incoming.id ? { ...m, is_read: true } : m))
-          );
-        }
+          case "message_error":
+            setMessages((prev) =>
+              prev.map((m) => (m.client_id === incoming.client_id ? { ...m, status: "failed" } : m))
+            );
+            break;
 
-        if (incoming.type === "reaction") {
-          setMessages((prev) =>
-            prev.map((m) => {
-              if (m.id !== incoming.message_id) return m;
-              if (incoming.action === "remove") {
-                return { ...m, reactions: m.reactions.filter((r) => r.user_id !== incoming.user_id) };
+          case "typing": {
+            if (incoming.user_id === userId) break;
+            const id = incoming.user_id;
+            setTypingUsers((prev) => ({ ...prev, [id]: incoming.pseudo }));
+            clearTimeout(typingTimersRef.current[id]);
+            typingTimersRef.current[id] = setTimeout(() => clearTyping(id), TYPING_TIMEOUT);
+            break;
+          }
+
+          case "read":
+            setRoom((prev) =>
+              prev && {
+                ...prev,
+                members: prev.members.map((m) =>
+                  m.id === incoming.user_id ? { ...m, last_read_at: incoming.read_at } : m
+                ),
               }
-              const filtered = m.reactions.filter((r) => r.user_id !== incoming.user_id);
-              return { ...m, reactions: [...filtered, { user_id: incoming.user_id, emoji: incoming.emoji }] };
-            })
-          );
+            );
+            break;
+
+          case "reaction":
+            setMessages((prev) =>
+              prev.map((m) => {
+                if (m.id !== incoming.message_id) return m;
+                const others = m.reactions.filter((r) => r.user_id !== incoming.user_id);
+                if (incoming.action === "remove") return { ...m, reactions: others };
+                return { ...m, reactions: [...others, { user_id: incoming.user_id, emoji: incoming.emoji }] };
+              })
+            );
+            break;
+
+          case "member_joined":
+          case "member_left":
+          case "room_updated":
+            refreshRoom();
+            break;
         }
       });
 
@@ -189,18 +282,24 @@ export default function ChatPage() {
         if (cancelled) return;
         console.warn(`[WS] closed code=${e.code} reason=${e.reason} attempt=${reconnectCountRef.current}`);
         wsRef.current = null;
+        setTypingUsers({});
+        // anything still waiting for an ack may or may not have been saved
+        setMessages((prev) =>
+          prev.some((m) => m.status === "pending")
+            ? prev.map((m) => (m.status === "pending" ? { ...m, status: "failed" } : m))
+            : prev
+        );
 
-        if (deletedRef.current) return;
+        if (removedRef.current) return;
 
         try {
-          const freshRoom = await getRoom(room_id);
-          if (!freshRoom.is_active) {
-            deletedRef.current = true;
-            setDeleted(true);
-            setConnState("closed");
+          await getRoom(room_id);
+        } catch (err) {
+          if (isStatus(err, 404)) {
+            markRemoved();
             return;
           }
-        } catch {}
+        }
 
         if (reconnectCountRef.current < MAX_RECONNECTS) {
           reconnectCountRef.current += 1;
@@ -210,10 +309,6 @@ export default function ChatPage() {
           setConnState("closed");
         }
       });
-
-      ws.addEventListener("error", () => {
-        // error always fires before close, let close handler deal with reconnect
-      });
     }
 
     init();
@@ -221,67 +316,99 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      Object.values(typingTimers).forEach(clearTimeout);
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
       }
     };
-  }, [room_id, user]);
+  }, [room_id, userId, refreshRoom, markRemoved, clearTyping]);
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, partnerTyping, scrollToBottom]);
+  const typingCount = Object.keys(typingUsers).length;
 
-  useEffect(() => {
-    if (!room) return;
-
-    function tick() {
-      const diff = new Date(room!.expires_at).getTime() - Date.now();
-      if (diff <= 0) {
-        setExpired(true);
-        setRemaining("0:00:00");
-        if (wsRef.current) {
-          wsRef.current.close();
-          wsRef.current = null;
-        }
-        return;
-      }
-      const h = Math.floor(diff / 3_600_000);
-      const m = Math.floor((diff % 3_600_000) / 60_000);
-      const s = Math.floor((diff % 60_000) / 1_000);
-      setRemaining(`${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`);
+  // Keep the view pinned: jump to the bottom on load/send, follow new messages
+  // when already near the bottom, and hold position when older ones are prepended.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const mode = scrollModeRef.current;
+    scrollModeRef.current = "none";
+    if (mode === "restore") {
+      el.scrollTop = restoreRef.current.top + (el.scrollHeight - restoreRef.current.height);
+    } else if (mode === "bottom" || nearBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
     }
+  }, [messages, typingCount]);
 
-    tick();
-    const interval = setInterval(tick, 1000);
-    return () => clearInterval(interval);
-  }, [room]);
+  const loadOlder = useCallback(async () => {
+    const oldest = messagesRef.current.find((m) => !m.status);
+    if (!oldest || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await getRoomMessages(room_id, oldest.id);
+      const el = scrollRef.current;
+      if (el) {
+        restoreRef.current = { height: el.scrollHeight, top: el.scrollTop };
+        scrollModeRef.current = "restore";
+      }
+      setMessages((prev) => {
+        const known = new Set(prev.map((m) => m.id));
+        return [...page.messages.filter((m) => !known.has(m.id)), ...prev];
+      });
+      setHasMore(page.has_more);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load older messages.");
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [room_id, loadingOlder]);
+
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM;
+    if (el.scrollTop < LOAD_OLDER_THRESHOLD && hasMore && !loadingOlder) {
+      loadOlder();
+    }
+  }
+
+  function sendContent(text: string) {
+    if (!user) return;
+    localIdRef.current += 1;
+    const clientId = `local-${Date.now()}-${localIdRef.current}`;
+    wsSend({ type: "message", content: text, client_id: clientId });
+    const localMsg: ChatMessage = {
+      id: clientId,
+      client_id: clientId,
+      status: "pending",
+      sender_id: user.id,
+      sender_pseudo: user.pseudo,
+      content: text,
+      sent_at: new Date().toISOString(),
+      reactions: [],
+    };
+    scrollModeRef.current = "bottom";
+    setMessages((prev) => [...prev, localMsg]);
+  }
 
   function handleSend(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const text = input.trim();
-    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !user) return;
-    localIdRef.current += 1;
-    const localId = `local-${localIdRef.current}`;
-    pendingAckQueue.current.push(localId);
-    wsSend({ type: "message", content: text });
-    const localMsg: Message = {
-      id: localId,
-      sender_id: user.id,
-      content: text,
-      is_read: false,
-      sent_at: new Date().toISOString(),
-      reactions: [],
-    };
-    setMessages((prev) => [...prev, localMsg]);
+    if (!text || wsRef.current?.readyState !== WebSocket.OPEN) return;
+    sendContent(text);
     setInput("");
     lastTypingSentRef.current = 0;
     inputRef.current?.focus();
+  }
+
+  function handleRetry(msg: ChatMessage) {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+    sendContent(msg.content);
   }
 
   function handleInputChange(value: string) {
@@ -297,45 +424,23 @@ export default function ChatPage() {
     setMessages((prev) =>
       prev.map((m) => {
         if (m.id !== messageId) return m;
-        const filtered = m.reactions.filter((r) => r.user_id !== user?.id);
-        return { ...m, reactions: reaction ? [...filtered, reaction] : filtered };
+        const others = m.reactions.filter((r) => r.user_id !== userId);
+        return { ...m, reactions: reaction ? [...others, reaction] : others };
       })
     );
   }
 
   async function handleReact(messageId: string, emoji: string) {
     setContextMsg(null);
-    const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === user?.id);
+    if (!userId) return;
+    const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === userId);
     if (existing?.emoji === emoji) {
       applyReactionOptimistically(messageId, null);
       try { await removeReaction(messageId); } catch { applyReactionOptimistically(messageId, existing); }
       return;
     }
-    applyReactionOptimistically(messageId, { user_id: user!.id, emoji });
+    applyReactionOptimistically(messageId, { user_id: userId, emoji });
     try { await addReaction(messageId, emoji); } catch { applyReactionOptimistically(messageId, existing ?? null); }
-  }
-
-  async function handleRemoveReaction(messageId: string) {
-    const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === user?.id);
-    if (!existing) return;
-    applyReactionOptimistically(messageId, null);
-    try { await removeReaction(messageId); } catch { applyReactionOptimistically(messageId, existing); }
-  }
-
-  async function handleDelete() {
-    if (!confirm("End this conversation? All messages will be deleted for both users.")) return;
-    try {
-      await deleteRoom(room_id);
-      deletedRef.current = true;
-      setDeleted(true);
-      setConnState("closed");
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete room.");
-    }
   }
 
   async function handleRename(e: React.FormEvent<HTMLFormElement>) {
@@ -344,45 +449,71 @@ export default function ChatPage() {
     if (!name) return;
     try {
       await renameRoom(room_id, name);
-      setRoom((prev) => {
-        if (!prev) return prev;
-        const isUserA = prev.country_a === user?.country;
-        return isUserA
-          ? { ...prev, user_a_room_name: name }
-          : { ...prev, user_b_room_name: name };
-      });
+      setRoom((prev) => prev && { ...prev, name });
       setShowRename(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to rename.");
     }
   }
 
-  function partnerCountry(): string {
-    if (!room || !user) return "";
-    return room.country_a === user.country ? room.country_b : room.country_a;
+  async function handleRemoveMember(member: Member) {
+    if (!confirm(`Remove ${member.pseudo} from this room?`)) return;
+    try {
+      await removeMember(room_id, member.id);
+      refreshRoom();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to remove member.");
+    }
   }
 
-  function partnerName(): string {
-    if (!room || !user) return "Stranger";
-    const isUserA = room.country_a === user.country;
-    return isUserA ? room.user_a_room_name : room.user_b_room_name;
+  async function handleLeave() {
+    if (!room || !userId) return;
+    const isOwner = room.owner_id === userId;
+    const note =
+      isOwner && room.members.length > 1
+        ? " Ownership will pass to the longest-standing member."
+        : isOwner
+          ? " You're the last member, so the room will be deleted."
+          : "";
+    if (!confirm(`Leave "${room.name}"?${note}`)) return;
+    try {
+      removedRef.current = true;
+      await removeMember(room_id, userId);
+      router.push("/rooms");
+    } catch (err) {
+      removedRef.current = false;
+      setError(err instanceof Error ? err.message : "Failed to leave room.");
+    }
   }
 
-  if (error) {
+  async function handleDelete() {
+    setShowMenu(false);
+    if (!confirm("Delete this room? All messages will be deleted for everyone.")) return;
+    try {
+      removedRef.current = true;
+      await deleteRoom(room_id);
+      router.push("/rooms");
+    } catch (err) {
+      removedRef.current = false;
+      setError(err instanceof Error ? err.message : "Failed to delete room.");
+    }
+  }
+
+  if (error && !room) {
     return (
       <div className="min-h-dvh bg-neutral-950 flex flex-col items-center justify-center px-4 gap-4">
         <p className="text-red-400 text-sm">{error}</p>
         <button
-          onClick={() => router.push("/pool")}
+          onClick={() => router.push("/rooms")}
           className="text-sm text-violet-400 hover:text-violet-300 transition"
         >
-          Back to pool
+          Back to rooms
         </button>
       </div>
     );
   }
 
-  if (!room) {
+  if (!room || !user) {
     return (
       <div className="min-h-dvh bg-neutral-950 flex items-center justify-center">
         <span className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
@@ -390,87 +521,122 @@ export default function ChatPage() {
     );
   }
 
-  const ended = expired || deleted;
+  const isOwner = room.owner_id === user.id;
+  const otherMembers = room.members.filter((m) => m.id !== user.id);
+  const memberById = new Map(room.members.map((m) => [m.id, m]));
+  const typingNames = Object.values(typingUsers);
+
+  function seenBy(msg: ChatMessage): Member[] {
+    const sent = new Date(msg.sent_at).getTime();
+    return otherMembers.filter((m) => new Date(m.last_read_at).getTime() >= sent);
+  }
+
+  const lastOwnSent = messages.findLast((m) => m.sender_id === user.id && !m.status);
+  const lastOwnSeenBy = lastOwnSent ? seenBy(lastOwnSent) : [];
 
   return (
     <div className="h-dvh bg-neutral-950 flex flex-col">
-      <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800 flex-shrink-0">
-        <div className="flex items-center gap-3">
+      <header className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800 flex-shrink-0">
+        <div className="flex items-center gap-3 min-w-0">
           <button
-            onClick={() => router.push("/pool")}
-            className="text-neutral-500 hover:text-neutral-300 transition"
+            onClick={() => router.push("/rooms")}
+            className="text-neutral-500 hover:text-neutral-300 transition flex-shrink-0"
+            aria-label="Back to rooms"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
             </svg>
           </button>
-          <div className="flex items-center gap-2">
-            <img
-              src={flagUrl(partnerCountry())}
-              alt={partnerCountry()}
-              width={20}
-              height={15}
-              className="rounded-sm object-cover"
-            />
-            <div className="flex flex-col">
-              <span className="text-sm font-medium text-neutral-200 leading-tight">
-                {partnerName()}
-              </span>
-              {partnerTyping && connState === "open" && (
-                <span className="text-[11px] text-violet-400 leading-tight">typing…</span>
+          <button
+            onClick={() => !removed && setShowMembers(true)}
+            className="flex items-center gap-2.5 min-w-0 text-left"
+          >
+            <span className="flex-shrink-0 w-8 h-8 rounded-full bg-violet-600/20 text-violet-300 flex items-center justify-center text-sm font-semibold uppercase">
+              {room.name.charAt(0)}
+            </span>
+            <span className="flex flex-col min-w-0">
+              <span className="text-sm font-medium text-neutral-200 leading-tight truncate">{room.name}</span>
+              {typingNames.length > 0 && connState === "open" ? (
+                <span className="text-[11px] text-violet-400 leading-tight truncate">
+                  {typingLabel(typingNames)}
+                </span>
+              ) : (
+                <span className="text-[11px] text-neutral-500 leading-tight truncate">
+                  {room.members.length === 1 ? "Just you" : `${room.members.length} members`}
+                </span>
               )}
-            </div>
-          </div>
+            </span>
+          </button>
         </div>
 
-        <div className="flex items-center gap-3">
-          {connState === "open" && !partnerTyping && (
+        <div className="flex items-center gap-3 flex-shrink-0">
+          {connState === "open" && (
             <span className="flex items-center gap-1.5 text-xs text-green-400">
               <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
-              Connected
+              <span className="hidden sm:inline">Connected</span>
             </span>
           )}
           {connState === "connecting" && (
             <span className="text-xs text-neutral-500">Connecting…</span>
           )}
-          {connState === "closed" && !ended && (
+          {connState === "closed" && !removed && (
             <span className="flex items-center gap-1.5 text-xs text-red-400">
               <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
               Disconnected
             </span>
           )}
-          {remaining && !ended && (
-            <span className="text-xs font-mono text-neutral-500">{remaining}</span>
-          )}
 
-          {!ended && (
+          {!removed && (
             <div className="relative">
               <button
                 onClick={() => setShowMenu((v) => !v)}
                 className="text-neutral-500 hover:text-neutral-300 transition p-1"
+                aria-label="Room menu"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01" />
                 </svg>
               </button>
               {showMenu && (
-                <div className="absolute right-0 top-full mt-1 w-44 bg-neutral-900 border border-neutral-800 rounded-xl shadow-lg z-50 overflow-hidden">
+                <div className="absolute right-0 top-full mt-1 w-48 bg-neutral-900 border border-neutral-800 rounded-xl shadow-lg z-40 overflow-hidden">
                   <button
                     onClick={() => {
-                      setRenameValue(partnerName());
-                      setShowRename(true);
+                      setShowMembers(true);
                       setShowMenu(false);
                     }}
                     className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
                   >
-                    Rename room
+                    Members & invites
                   </button>
+                  {isOwner && (
+                    <button
+                      onClick={() => {
+                        setRenameValue(room.name);
+                        setShowRename(true);
+                        setShowMenu(false);
+                      }}
+                      className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
+                    >
+                      Rename room
+                    </button>
+                  )}
                   <button
-                    onClick={handleDelete}
-                    className="w-full text-left px-4 py-2.5 text-sm text-red-400 hover:bg-neutral-800 transition"
+                    onClick={() => {
+                      setShowMenu(false);
+                      handleLeave();
+                    }}
+                    className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
                   >
-                    End conversation
+                    Leave room
                   </button>
+                  {isOwner && (
+                    <button
+                      onClick={handleDelete}
+                      className="w-full text-left px-4 py-2.5 text-sm text-red-400 hover:bg-neutral-800 transition"
+                    >
+                      Delete room
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -486,8 +652,9 @@ export default function ChatPage() {
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
               maxLength={64}
-              placeholder="Enter a name…"
+              placeholder="Room name…"
               autoFocus
+              onFocus={(e) => e.target.select()}
               className="flex-1 bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-violet-500"
             />
             <button
@@ -508,110 +675,191 @@ export default function ChatPage() {
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2" onClick={() => setShowMenu(false)}>
-        {messages.length === 0 && !ended && (
-          <div className="flex items-center justify-center h-full">
-            <p className="text-sm text-neutral-600">Say hi to your stranger.</p>
+      {error && (
+        <div className="flex items-center justify-between gap-3 border-b border-red-900/50 bg-red-900/20 px-4 py-2 text-xs text-red-300 flex-shrink-0">
+          <span>{error}</span>
+          <button onClick={() => setError(null)} className="text-red-400 hover:text-red-200" aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        onClick={() => setShowMenu(false)}
+        className="flex-1 overflow-y-auto px-4 py-4"
+        style={{ scrollBehavior: "auto" }}
+      >
+        {hasMore && (
+          <div className="flex justify-center pb-3">
+            <button
+              onClick={loadOlder}
+              disabled={loadingOlder}
+              className="text-xs text-neutral-500 hover:text-neutral-300 transition disabled:opacity-60"
+            >
+              {loadingOlder ? "Loading…" : "Load earlier messages"}
+            </button>
           </div>
         )}
 
-        {messages.map((msg) => {
-          const isOwn = msg.sender_id === user?.id;
-          const myReaction = msg.reactions.find((r) => r.user_id === user?.id);
-          const partnerReaction = msg.reactions.find((r) => r.user_id !== user?.id);
-          return (
-            <div
-              key={msg.id}
-              className={`flex ${isOwn ? "justify-end" : "justify-start"}`}
-            >
-              <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
-                <div
-                  className={`rounded-2xl px-4 py-2 text-sm break-words select-none touch-none ${
-                    isOwn
-                      ? "bg-violet-600 text-white rounded-br-md"
-                      : "bg-neutral-800 text-neutral-100 rounded-bl-md"
-                  }`}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    holdTimerRef.current = setTimeout(() => {
-                      holdTimerRef.current = null;
-                      lastTapRef.current = null;
-                      setContextMsg(msg);
-                    }, 400);
-                  }}
-                  onPointerUp={(e) => {
-                    e.stopPropagation();
-                    if (holdTimerRef.current) {
-                      clearTimeout(holdTimerRef.current);
-                      holdTimerRef.current = null;
-                      const now = Date.now();
-                      const last = lastTapRef.current;
-                      if (last?.id === msg.id && now - last.time < 300) {
-                        lastTapRef.current = null;
-                        handleReact(msg.id, "❤️");
-                      } else {
-                        lastTapRef.current = { id: msg.id, time: now };
-                      }
-                    }
-                  }}
-                  onPointerLeave={() => {
-                    if (holdTimerRef.current) {
-                      clearTimeout(holdTimerRef.current);
-                      holdTimerRef.current = null;
-                    }
-                  }}
+        {messages.length === 0 && !removed && (
+          <div className="flex flex-col items-center justify-center h-full gap-3 text-center">
+            {otherMembers.length === 0 ? (
+              <>
+                <p className="text-sm text-neutral-500">It&apos;s just you in here for now.</p>
+                <button
+                  onClick={() => setShowMembers(true)}
+                  className="px-4 py-2 text-sm font-medium bg-violet-600 hover:bg-violet-500 text-white rounded-xl transition"
                 >
-                  <p>{msg.content}</p>
-                  <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
-                    <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
-                      {new Date(msg.sent_at).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                    </span>
-                    {isOwn && (
-                      <svg
-                        className={`w-3.5 h-3.5 ${msg.is_read ? "text-violet-300" : "text-violet-400/40"}`}
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        {msg.is_read ? (
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
-                        ) : (
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
-                        )}
-                      </svg>
-                    )}
-                  </div>
-                </div>
+                  Invite people
+                </button>
+              </>
+            ) : (
+              <p className="text-sm text-neutral-600">No messages yet. Say hi 👋</p>
+            )}
+          </div>
+        )}
 
-                {/* Reaction badges */}
-                {(myReaction || partnerReaction) && (
-                  <div className="flex gap-1 mt-1 flex-wrap">
-                    {partnerReaction && (
-                      <span className="text-sm leading-none bg-neutral-800 border border-neutral-700 rounded-full px-2 py-0.5">
-                        {partnerReaction.emoji}
+        {messages.map((msg, i) => {
+          const prev = messages[i - 1];
+          const isOwn = msg.sender_id === user.id;
+          const newDay = !prev || !sameDay(prev.sent_at, msg.sent_at);
+          const showSender = !isOwn && (newDay || prev.sender_id !== msg.sender_id);
+          const confirmed = !msg.status;
+          const seen = isOwn && confirmed ? seenBy(msg) : [];
+          const seenByAll = otherMembers.length > 0 && seen.length === otherMembers.length;
+          const reactionGroups = groupReactions(msg.reactions, user.id);
+
+          return (
+            <div key={msg.client_id ?? msg.id}>
+              {newDay && (
+                <div className="flex items-center gap-3 my-4">
+                  <span className="flex-1 h-px bg-neutral-800" />
+                  <span className="text-[11px] font-medium text-neutral-500">{formatDay(msg.sent_at)}</span>
+                  <span className="flex-1 h-px bg-neutral-800" />
+                </div>
+              )}
+
+              <div className={`flex ${isOwn ? "justify-end" : "justify-start"} ${showSender || newDay ? "mt-3" : "mt-1"}`}>
+                <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
+                  {showSender && (
+                    <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id)}`}>
+                      {msg.sender_pseudo}
+                    </span>
+                  )}
+                  <div
+                    className={`rounded-2xl px-4 py-2 text-sm break-words select-none touch-none ${
+                      isOwn
+                        ? `bg-violet-600 text-white rounded-br-md ${msg.status === "failed" ? "opacity-60" : ""}`
+                        : "bg-neutral-800 text-neutral-100 rounded-bl-md"
+                    }`}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      if (!confirmed) return;
+                      holdTimerRef.current = setTimeout(() => {
+                        holdTimerRef.current = null;
+                        lastTapRef.current = null;
+                        setContextMsg(msg);
+                      }, 400);
+                    }}
+                    onPointerUp={(e) => {
+                      e.stopPropagation();
+                      if (!confirmed) return;
+                      if (holdTimerRef.current) {
+                        clearTimeout(holdTimerRef.current);
+                        holdTimerRef.current = null;
+                        const now = Date.now();
+                        const last = lastTapRef.current;
+                        if (last?.id === msg.id && now - last.time < 300) {
+                          lastTapRef.current = null;
+                          handleReact(msg.id, "❤️");
+                        } else {
+                          lastTapRef.current = { id: msg.id, time: now };
+                        }
+                      }
+                    }}
+                    onPointerLeave={() => {
+                      if (holdTimerRef.current) {
+                        clearTimeout(holdTimerRef.current);
+                        holdTimerRef.current = null;
+                      }
+                    }}
+                  >
+                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
+                      <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
+                        {formatTime(msg.sent_at)}
                       </span>
-                    )}
-                    {myReaction && (
-                      <button
-                        onClick={() => handleRemoveReaction(msg.id)}
-                        className="text-sm leading-none bg-violet-600/20 border border-violet-500/40 rounded-full px-2 py-0.5 hover:bg-red-900/30 hover:border-red-500/40 transition"
-                        title="Remove your reaction"
-                      >
-                        {myReaction.emoji}
-                      </button>
-                    )}
+                      {isOwn && confirmed && (
+                        <svg
+                          className={`w-3.5 h-3.5 ${seenByAll ? "text-violet-200" : "text-violet-400/60"}`}
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          {seenByAll ? (
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
+                          ) : (
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
+                          )}
+                        </svg>
+                      )}
+                      {msg.status === "pending" && (
+                        <svg className="w-3 h-3 text-violet-300/70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                          <path strokeLinecap="round" strokeWidth={2} d="M12 7v5l3 2" />
+                        </svg>
+                      )}
+                    </div>
                   </div>
-                )}
+
+                  {msg.status === "failed" && (
+                    <button
+                      onClick={() => handleRetry(msg)}
+                      className="mt-1 text-[11px] text-red-400 hover:text-red-300 transition"
+                    >
+                      Not sent · tap to retry
+                    </button>
+                  )}
+
+                  {reactionGroups.length > 0 && (
+                    <div className="flex gap-1 mt-1 flex-wrap">
+                      {reactionGroups.map((g) => (
+                        <button
+                          key={g.emoji}
+                          onClick={() => handleReact(msg.id, g.emoji)}
+                          title={g.userIds.map((id) => (id === user.id ? "You" : memberById.get(id)?.pseudo ?? "Former member")).join(", ")}
+                          className={`flex items-center gap-1 text-sm leading-none rounded-full px-2 py-0.5 border transition ${
+                            g.mine
+                              ? "bg-violet-600/20 border-violet-500/40 hover:bg-red-900/30 hover:border-red-500/40"
+                              : "bg-neutral-800 border-neutral-700 hover:border-neutral-500"
+                          }`}
+                        >
+                          {g.emoji}
+                          {g.userIds.length > 1 && (
+                            <span className="text-[11px] text-neutral-300 tabular-nums">{g.userIds.length}</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {msg === lastOwnSent && lastOwnSeenBy.length > 0 && (
+                    <span className="mt-1 text-[10px] text-neutral-500">
+                      {seenByAll && otherMembers.length > 1
+                        ? "Seen by everyone"
+                        : `Seen by ${lastOwnSeenBy.map((m) => m.pseudo).join(", ")}`}
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
           );
         })}
 
-        {partnerTyping && connState === "open" && (
-          <div className="flex justify-start">
+        {typingNames.length > 0 && connState === "open" && (
+          <div className="flex justify-start mt-3">
             <div className="bg-neutral-800 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:0ms]" />
               <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:150ms]" />
@@ -619,28 +867,18 @@ export default function ChatPage() {
             </div>
           </div>
         )}
-
-        <div ref={bottomRef} />
       </div>
 
-      {deleted ? (
+      {removed ? (
         <div className="border-t border-neutral-800 px-4 py-5 text-center flex-shrink-0">
-          <p className="text-sm text-neutral-400 mb-3">This conversation has ended.</p>
+          <p className="text-sm text-neutral-400 mb-3">
+            This room was deleted or you&apos;re no longer a member.
+          </p>
           <button
-            onClick={() => router.push("/pool")}
+            onClick={() => router.push("/rooms")}
             className="px-5 py-2 text-sm font-medium bg-violet-600 hover:bg-violet-500 text-white rounded-xl transition"
           >
-            Find a new match
-          </button>
-        </div>
-      ) : expired ? (
-        <div className="border-t border-neutral-800 px-4 py-5 text-center flex-shrink-0">
-          <p className="text-sm text-neutral-400 mb-3">This room has expired.</p>
-          <button
-            onClick={() => router.push("/pool")}
-            className="px-5 py-2 text-sm font-medium bg-violet-600 hover:bg-violet-500 text-white rounded-xl transition"
-          >
-            Find a new match
+            Back to rooms
           </button>
         </div>
       ) : (
@@ -655,6 +893,7 @@ export default function ChatPage() {
             onChange={(e) => handleInputChange(e.target.value)}
             placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
             disabled={connState !== "open"}
+            maxLength={2000}
             autoFocus
             className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
           />
@@ -662,6 +901,7 @@ export default function ChatPage() {
             type="submit"
             disabled={connState !== "open" || !input.trim()}
             className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
+            aria-label="Send"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
@@ -670,11 +910,21 @@ export default function ChatPage() {
         </form>
       )}
 
+      {showMembers && (
+        <MembersPanel
+          room={room}
+          currentUserId={user.id}
+          refreshKey={roomVersion}
+          onClose={() => setShowMembers(false)}
+          onRemove={handleRemoveMember}
+          onLeave={handleLeave}
+        />
+      )}
+
       {/* Long-press reaction overlay */}
       {contextMsg && (() => {
-        const isOwn = contextMsg.sender_id === user?.id;
-        const myReaction = contextMsg.reactions.find((r) => r.user_id === user?.id);
-        const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+        const isOwn = contextMsg.sender_id === user.id;
+        const myReaction = contextMsg.reactions.find((r) => r.user_id === user.id);
         return (
           <div
             className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 px-6"
@@ -689,10 +939,15 @@ export default function ChatPage() {
                   : "bg-neutral-800 text-neutral-100 rounded-bl-md self-start"
               }`}
             >
-              <p>{contextMsg.content}</p>
+              {!isOwn && (
+                <p className={`text-[11px] font-medium mb-0.5 ${nameColor(contextMsg.sender_id)}`}>
+                  {contextMsg.sender_pseudo}
+                </p>
+              )}
+              <p className="whitespace-pre-wrap">{contextMsg.content}</p>
               <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
                 <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
-                  {new Date(contextMsg.sent_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  {formatTime(contextMsg.sent_at)}
                 </span>
               </div>
             </div>
@@ -719,4 +974,19 @@ export default function ChatPage() {
       })()}
     </div>
   );
+}
+
+/** Groups a message's reactions by emoji, in first-reacted order. */
+function groupReactions(reactions: Reaction[], currentUserId: string) {
+  const groups: { emoji: string; userIds: string[]; mine: boolean }[] = [];
+  for (const r of reactions) {
+    let g = groups.find((x) => x.emoji === r.emoji);
+    if (!g) {
+      g = { emoji: r.emoji, userIds: [], mine: false };
+      groups.push(g);
+    }
+    g.userIds.push(r.user_id);
+    if (r.user_id === currentUserId) g.mine = true;
+  }
+  return groups;
 }

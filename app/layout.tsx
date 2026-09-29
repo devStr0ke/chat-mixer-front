@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ChatMixer — Anonymous Ephemeral Chat",
-  description: "Get matched with a random stranger for a 24h anonymous conversation.",
+  title: "ChatMixer — Group Chat",
+  description: "Create rooms, invite your friends, and chat in real time.",
 };
 
 export const viewport: Viewport = {

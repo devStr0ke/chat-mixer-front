@@ -101,33 +101,44 @@ export function login(payload: LoginPayload) {
   });
 }
 
-export interface JoinPoolResponse {
-  message?: string;
-  room_id?: string;
+export interface UserSummary {
+  id: string;
+  pseudo: string;
+  country: string;
 }
 
-export function joinPool(sameCountry = false) {
-  return apiFetch<JoinPoolResponse>("/pool/join", {
-    method: "POST",
-    body: JSON.stringify({ same_country: sameCountry }),
-  });
-}
-
-export function leavePool() {
-  return apiFetch<{ message: string }>("/pool/leave", {
-    method: "POST",
-  });
+export function searchUsers(q: string) {
+  return apiFetch<UserSummary[]>(`/users/search?q=${encodeURIComponent(q)}`);
 }
 
 export interface Room {
   id: string;
-  country_a: string;
-  country_b: string;
-  user_a_room_name: string;
-  user_b_room_name: string;
+  name: string;
+  owner_id: string;
   created_at: string;
-  expires_at: string;
-  is_active: boolean;
+}
+
+export interface LastMessage {
+  id: string;
+  sender_id: string;
+  sender_pseudo: string;
+  content: string;
+  sent_at: string;
+}
+
+export interface RoomSummary extends Room {
+  member_count: number;
+  unread_count: number;
+  last_message: LastMessage | null;
+}
+
+export interface Member extends UserSummary {
+  joined_at: string;
+  last_read_at: string;
+}
+
+export interface RoomDetail extends Room {
+  members: Member[];
 }
 
 export interface Reaction {
@@ -138,26 +149,48 @@ export interface Reaction {
 export interface Message {
   id: string;
   sender_id: string;
+  sender_pseudo: string;
   content: string;
-  is_read: boolean;
   sent_at: string;
   reactions: Reaction[];
 }
 
-export function getRoom(roomId: string) {
-  return apiFetch<Room>(`/rooms/${roomId}`);
+export interface MessagePage {
+  messages: Message[];
+  has_more: boolean;
+}
+
+export interface Invitation {
+  id: string;
+  room_id: string;
+  room_name: string;
+  inviter: UserSummary;
+  invitee: UserSummary;
+  created_at: string;
+}
+
+export function createRoom(name: string, pseudos: string[] = []) {
+  return apiFetch<Room>("/rooms", {
+    method: "POST",
+    body: JSON.stringify({ name, pseudos }),
+  });
 }
 
 export function getMyRooms() {
-  return apiFetch<Room[]>("/rooms/me");
+  return apiFetch<RoomSummary[]>("/rooms/me");
 }
 
-export function getRoomMessages(roomId: string) {
-  return apiFetch<Message[]>(`/rooms/${roomId}/messages`);
+export function getRoom(roomId: string) {
+  return apiFetch<RoomDetail>(`/rooms/${roomId}`);
+}
+
+export function getRoomMessages(roomId: string, before?: string) {
+  const query = before ? `?before=${encodeURIComponent(before)}` : "";
+  return apiFetch<MessagePage>(`/rooms/${roomId}/messages${query}`);
 }
 
 export function renameRoom(roomId: string, name: string) {
-  return apiFetch<{ message: string }>(`/rooms/${roomId}/name`, {
+  return apiFetch<{ message: string }>(`/rooms/${roomId}`, {
     method: "PATCH",
     body: JSON.stringify({ name }),
   });
@@ -165,6 +198,41 @@ export function renameRoom(roomId: string, name: string) {
 
 export function deleteRoom(roomId: string) {
   return apiFetch<{ message: string }>(`/rooms/${roomId}`, {
+    method: "DELETE",
+  });
+}
+
+/** Removes a member; pass your own id to leave the room. */
+export function removeMember(roomId: string, userId: string) {
+  return apiFetch<{ message: string }>(`/rooms/${roomId}/members/${userId}`, {
+    method: "DELETE",
+  });
+}
+
+export function getRoomInvitations(roomId: string) {
+  return apiFetch<Invitation[]>(`/rooms/${roomId}/invitations`);
+}
+
+export function inviteToRoom(roomId: string, pseudo: string) {
+  return apiFetch<Invitation>(`/rooms/${roomId}/invitations`, {
+    method: "POST",
+    body: JSON.stringify({ pseudo }),
+  });
+}
+
+export function getMyInvitations() {
+  return apiFetch<Invitation[]>("/invitations");
+}
+
+export function acceptInvitation(invitationId: string) {
+  return apiFetch<{ room_id: string }>(`/invitations/${invitationId}/accept`, {
+    method: "POST",
+  });
+}
+
+/** Declines (as invitee) or cancels (as inviter or room owner) an invitation. */
+export function deleteInvitation(invitationId: string) {
+  return apiFetch<{ message: string }>(`/invitations/${invitationId}`, {
     method: "DELETE",
   });
 }
@@ -183,21 +251,42 @@ export function removeReaction(messageId: string) {
 }
 
 export type WsOutgoing =
-  | { type: "message"; content: string }
+  | { type: "message"; content: string; client_id: string }
   | { type: "typing" }
   | { type: "read"; id: string };
 
 export type WsIncoming =
-  | { type: "message"; id: string; content: string }
-  | { type: "message_ack"; id: string }
-  | { type: "typing" }
-  | { type: "read"; id: string }
+  | {
+      type: "message";
+      id: string;
+      room_id: string;
+      sender_id: string;
+      sender_pseudo: string;
+      content: string;
+      sent_at: string;
+    }
+  | { type: "message_ack"; id: string; client_id: string; sent_at: string }
+  | { type: "message_error"; client_id: string }
+  | { type: "typing"; user_id: string; pseudo: string }
+  | { type: "read"; user_id: string; read_at: string }
   | { type: "reaction"; message_id: string; user_id: string; action: "add"; emoji: string }
-  | { type: "reaction"; message_id: string; user_id: string; action: "remove" };
+  | { type: "reaction"; message_id: string; user_id: string; action: "remove" }
+  | { type: "member_joined"; room_id: string; user_id: string }
+  | { type: "member_left"; room_id: string; user_id: string }
+  | { type: "room_updated"; room_id: string };
 
 export type WsNotification =
-  | { type: "new_message"; room_id: string; id: string }
-  | { type: "room_closed"; room_id: string }
+  | {
+      type: "new_message";
+      id: string;
+      room_id: string;
+      sender_id: string;
+      sender_pseudo: string;
+      content: string;
+      sent_at: string;
+    }
+  | { type: "invitation"; room_id: string }
+  | { type: "room_removed"; room_id: string }
   | { type: "online_count"; count: number };
 
 export function createChatWebSocket(roomId: string): WebSocket {

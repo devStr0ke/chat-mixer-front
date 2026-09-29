@@ -18,7 +18,7 @@ export function proxy(request: NextRequest) {
 
   if (isPublic) {
     if (token) {
-      return NextResponse.redirect(new URL("/pool", request.url));
+      return NextResponse.redirect(new URL("/rooms", request.url));
     }
     return NextResponse.next();
   }

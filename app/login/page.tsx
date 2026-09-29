@@ -22,7 +22,7 @@ export default function LoginPage() {
     try {
       const data = await login({ identifier, password });
       setAuth(data.token, data.user);
-      router.push("/pool");
+      router.push("/rooms");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed.");
     } finally {
@@ -38,7 +38,7 @@ export default function LoginPage() {
             Chat<span className="text-violet-500">Mixer</span>
           </h1>
           <p className="mt-2 text-sm text-neutral-400">
-            Anonymous ephemeral conversations
+            Group chats with your people
           </p>
         </div>
 
