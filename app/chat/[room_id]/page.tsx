@@ -12,6 +12,7 @@ import {
   removeMember,
   addReaction,
   removeReaction,
+  editMessage,
   ACCEPTED_IMAGE_TYPES,
   type RoomDetail,
   type Member,
@@ -31,6 +32,7 @@ import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentG
 import { Lightbox } from "@/components/Lightbox";
 import { PendingUploads } from "@/components/PendingUploads";
 import { RoomAppearancePanel } from "@/components/RoomAppearancePanel";
+import { EditHistoryDialog } from "@/components/EditHistoryDialog";
 import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
 import { resolveTheme } from "@/lib/theme";
 
@@ -137,6 +139,11 @@ export default function ChatPage() {
   // message id the full emoji picker is reacting to
   const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  // own message being edited: the message box holds its text until saved or cancelled
+  const [editing, setEditing] = useState<ChatMessage | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+  // message id whose edit history is open
+  const [historyFor, setHistoryFor] = useState<string | null>(null);
   // briefly highlighted after jumping to it from a reply's quote
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [showAppearance, setShowAppearance] = useState(false);
@@ -160,6 +167,8 @@ export default function ChatPage() {
   const caretRef = useRef<{ start: number; end: number } | null>(null);
   // message to scroll to once the older pages containing it have rendered
   const pendingJumpRef = useRef<string | null>(null);
+  // what was being typed before an edit started, restored afterwards
+  const draftRef = useRef("");
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragDepthRef = useRef(0);
 
@@ -219,6 +228,19 @@ export default function ChatPage() {
     },
     [userId]
   );
+
+  const applyEdit = useCallback((id: string, content: string, editedAt: string | null) => {
+    setMessages((prev) =>
+      prev.map((m) => {
+        let next = m;
+        if (m.id === id) next = { ...next, content, edited_at: editedAt };
+        // quotes of the edited message follow its new text
+        if (m.reply_to?.id === id) next = { ...next, reply_to: { ...m.reply_to, content: content.slice(0, 140) } };
+        return next;
+      })
+    );
+    setReplyTo((prev) => (prev?.id === id ? { ...prev, content } : prev));
+  }, []);
 
   const clearTyping = useCallback((id: string) => {
     clearTimeout(typingTimersRef.current[id]);
@@ -313,6 +335,7 @@ export default function ChatPage() {
               attachments: incoming.attachments ?? [],
               gif: incoming.gif ?? null,
               reply_to: incoming.reply_to ?? null,
+              edited_at: null,
             };
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
@@ -356,6 +379,10 @@ export default function ChatPage() {
                 ),
               }
             );
+            break;
+
+          case "message_edited":
+            applyEdit(incoming.id, incoming.content ?? "", incoming.edited_at);
             break;
 
           case "reaction":
@@ -421,7 +448,7 @@ export default function ChatPage() {
         wsRef.current = null;
       }
     };
-  }, [room_id, userId, refreshRoom, markRemoved, clearTyping, markReadIfViewing]);
+  }, [room_id, userId, refreshRoom, markRemoved, clearTyping, markReadIfViewing, applyEdit]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -571,6 +598,7 @@ export default function ChatPage() {
       attachments,
       gif,
       reply_to: reply,
+      edited_at: null,
     };
     scrollModeRef.current = "bottom";
     setMessages((prev) => [...prev, localMsg]);
@@ -578,6 +606,10 @@ export default function ChatPage() {
 
   function handleSend(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (editing) {
+      saveEdit();
+      return;
+    }
     const text = input.trim();
     if (composer.blocked || (!text && composer.ready === 0)) return;
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
@@ -605,8 +637,63 @@ export default function ChatPage() {
   function startReply(msg: ChatMessage) {
     setContextMsg(null);
     setPicker(null);
+    if (editing) stopEditing();
     setReplyTo(msg);
     setTimeout(() => inputRef.current?.focus(), 0);
+  }
+
+  function startEdit(msg: ChatMessage) {
+    setContextMsg(null);
+    setPicker(null);
+    setPanel(null);
+    setReplyTo(null);
+    if (!editing) draftRef.current = input;
+    setEditing(msg);
+    setInput(msg.content);
+    const caret = msg.content.length;
+    caretRef.current = { start: caret, end: caret };
+    setTimeout(() => {
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(caret, caret);
+    }, 0);
+  }
+
+  /** Leaves edit mode and puts back whatever was being typed before. */
+  function stopEditing() {
+    setEditing(null);
+    setInput(draftRef.current);
+    caretRef.current = null;
+    draftRef.current = "";
+  }
+
+  async function saveEdit() {
+    if (!editing || savingEdit) return;
+    const text = input.trim();
+    if (text === editing.content) {
+      stopEditing();
+      return;
+    }
+    if (!text && mediaOf(editing).length === 0) return;
+
+    setSavingEdit(true);
+    try {
+      const res = await editMessage(editing.id, text);
+      applyEdit(res.id, res.content, res.edited_at);
+      stopEditing();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to edit the message.");
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  function openHistory(msg: ChatMessage) {
+    if (holdFiredRef.current) {
+      holdFiredRef.current = false;
+      return;
+    }
+    setContextMsg(null);
+    setHistoryFor(msg.id);
   }
 
   async function jumpToMessage(id: string) {
@@ -657,13 +744,13 @@ export default function ChatPage() {
 
   function handlePaste(e: React.ClipboardEvent<HTMLInputElement>) {
     const files = imageFiles(e.clipboardData.files);
-    if (files.length === 0) return;
+    if (files.length === 0 || editing) return;
     e.preventDefault();
     composer.addFiles(files);
   }
 
   function handleDragEnter(e: React.DragEvent) {
-    if (removed || !e.dataTransfer.types.includes("Files")) return;
+    if (removed || editing || !e.dataTransfer.types.includes("Files")) return;
     e.preventDefault();
     dragDepthRef.current += 1;
     setDragging(true);
@@ -678,7 +765,7 @@ export default function ChatPage() {
     e.preventDefault();
     dragDepthRef.current = 0;
     setDragging(false);
-    if (removed) return;
+    if (removed || editing) return;
     composer.addFiles(Array.from(e.dataTransfer.files));
   }
 
@@ -716,7 +803,7 @@ export default function ChatPage() {
   function handleInputChange(value: string) {
     setInput(value);
     const now = Date.now();
-    if (value.trim() && now - lastTypingSentRef.current > TYPING_THROTTLE) {
+    if (!editing && value.trim() && now - lastTypingSentRef.current > TYPING_THROTTLE) {
       lastTypingSentRef.current = now;
       wsSend({ type: "typing" });
     }
@@ -1177,6 +1264,16 @@ export default function ChatPage() {
                           hasAttachments ? "px-3 pb-1" : ""
                         }`}
                       >
+                        {msg.edited_at && (
+                          <button
+                            type="button"
+                            onClick={() => openHistory(msg)}
+                            title="See edit history"
+                            className="text-[10px] opacity-70 underline decoration-dotted underline-offset-2 hover:opacity-100"
+                          >
+                            edited
+                          </button>
+                        )}
                         <span className="text-[10px] opacity-70">{formatTime(msg.sent_at)}</span>
                         {isOwn && confirmed && (
                           <svg
@@ -1231,6 +1328,17 @@ export default function ChatPage() {
                         >
                           <ReplyIcon className="w-4 h-4" />
                         </button>
+                        {isOwn && (
+                          <button
+                            type="button"
+                            onClick={() => startEdit(msg)}
+                            title="Edit"
+                            aria-label="Edit"
+                            className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                          >
+                            <EditIcon className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                     )}
 
@@ -1350,6 +1458,23 @@ export default function ChatPage() {
             </div>
           )}
           <form onSubmit={handleSend} className="border-t border-neutral-800">
+            {editing && (
+              <div className="flex items-center gap-3 px-4 pt-3">
+                <EditIcon className="w-4 h-4 flex-shrink-0 text-amber-400" />
+                <div className="min-w-0 flex-1 border-l-2 border-amber-500 pl-2.5">
+                  <p className="truncate text-xs font-medium text-amber-300">Editing message</p>
+                  <p className="truncate text-xs text-neutral-400">{replySnippet(replyPreviewOf(editing))}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={stopEditing}
+                  className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-neutral-500 transition hover:bg-neutral-800 hover:text-neutral-200"
+                  aria-label="Cancel edit"
+                >
+                  ×
+                </button>
+              </div>
+            )}
             {replyTo && (
               <div className="flex items-center gap-3 px-4 pt-3">
                 <ReplyIcon className="w-4 h-4 flex-shrink-0 text-violet-400" />
@@ -1385,7 +1510,8 @@ export default function ChatPage() {
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2 sm:p-2.5 transition"
+                disabled={!!editing}
+                className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2 sm:p-2.5 transition disabled:opacity-40 disabled:pointer-events-none"
                 aria-label="Add images"
                 title="Add images (or paste / drop them)"
               >
@@ -1415,8 +1541,8 @@ export default function ChatPage() {
                 type="button"
                 data-composer-panel
                 onClick={() => setPanel((p) => (p === "gif" ? null : "gif"))}
-                disabled={connState !== "open"}
-                className={`rounded-xl p-2 sm:p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-50 ${
+                disabled={connState !== "open" || !!editing}
+                className={`rounded-xl p-2 sm:p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-40 disabled:pointer-events-none ${
                   panel === "gif" ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
                 }`}
                 aria-label="GIF"
@@ -1439,7 +1565,18 @@ export default function ChatPage() {
                 onSelect={saveCaret}
                 onKeyUp={saveCaret}
                 onKeyDown={(e) => {
-                  if (e.key === "Escape" && replyTo) setReplyTo(null);
+                  if (e.key === "Escape") {
+                    if (editing) stopEditing();
+                    else if (replyTo) setReplyTo(null);
+                  }
+                  // ↑ in an empty box edits your last message, as in most desktop chat apps
+                  if (e.key === "ArrowUp" && !editing && input === "") {
+                    const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status);
+                    if (lastOwn) {
+                      e.preventDefault();
+                      startEdit(lastOwn);
+                    }
+                  }
                 }}
                 onClick={saveCaret}
                 placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
@@ -1450,12 +1587,20 @@ export default function ChatPage() {
               />
               <button
                 type="submit"
-                disabled={connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0)}
+                disabled={
+                  editing
+                    ? savingEdit || (!input.trim() && mediaOf(editing).length === 0)
+                    : connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0)
+                }
                 className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
-                aria-label="Send"
+                aria-label={editing ? "Save edit" : "Send"}
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                  {editing ? (
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
+                  ) : (
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                  )}
                 </svg>
               </button>
             </div>
@@ -1483,6 +1628,8 @@ export default function ChatPage() {
           <p className="text-sm font-medium text-violet-300">Drop images to send</p>
         </div>
       )}
+
+      {historyFor && <EditHistoryDialog messageId={historyFor} onClose={() => setHistoryFor(null)} />}
 
       {showAppearance && (
         <RoomAppearancePanel
@@ -1546,21 +1693,50 @@ export default function ChatPage() {
               />
             </div>
 
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                startReply(contextMsg);
-              }}
-              className="flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
-            >
-              <ReplyIcon className="w-4 h-4" />
-              Reply
-            </button>
+            <div className="flex flex-wrap justify-center gap-2" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                onClick={() => startReply(contextMsg)}
+                className="flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
+              >
+                <ReplyIcon className="w-4 h-4" />
+                Reply
+              </button>
+              {isOwn && (
+                <button
+                  type="button"
+                  onClick={() => startEdit(contextMsg)}
+                  className="flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
+                >
+                  <EditIcon className="w-4 h-4" />
+                  Edit
+                </button>
+              )}
+              {contextMsg.edited_at && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContextMsg(null);
+                    setHistoryFor(contextMsg.id);
+                  }}
+                  className="rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
+                >
+                  Edit history
+                </button>
+              )}
+            </div>
           </div>
         );
       })()}
     </div>
+  );
+}
+
+function EditIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 20h4L19 9a2.8 2.8 0 00-4-4L4 16v4zM13.5 6.5l4 4" />
+    </svg>
   );
 }
 

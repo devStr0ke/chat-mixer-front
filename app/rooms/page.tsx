@@ -117,6 +117,13 @@ export default function RoomsPage() {
               });
               break;
             }
+            case "message_edited":
+              setRooms((prev) =>
+                prev.map((r) =>
+                  r.last_message?.id === msg.id ? { ...r, last_message: { ...r.last_message, content: msg.content } } : r
+                )
+              );
+              break;
             case "room_read":
               setRooms((prev) =>
                 prev.map((r) => (r.id === msg.room_id && r.unread_count > 0 ? { ...r, unread_count: 0 } : r))

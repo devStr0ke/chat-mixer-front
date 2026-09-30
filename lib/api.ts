@@ -240,6 +240,26 @@ export interface Message {
   attachments: Attachment[];
   gif: MessageGif | null;
   reply_to: ReplyPreview | null;
+  /** set once the sender has edited the text */
+  edited_at: string | null;
+}
+
+/** One version of a message's text and when it was written. */
+export interface MessageVersion {
+  content: string;
+  at: string;
+}
+
+export function editMessage(messageId: string, content: string) {
+  return apiFetch<{ id: string; content: string; edited_at: string | null }>(`/messages/${messageId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ content }),
+  });
+}
+
+/** Every version of a message, oldest first; the last one is the current text. */
+export function getMessageEdits(messageId: string) {
+  return apiFetch<{ versions: MessageVersion[] }>(`/messages/${messageId}/edits`);
 }
 
 /** The quoted message shown inside a reply (its text is truncated by the server). */
@@ -412,6 +432,7 @@ export type WsIncoming =
       gif?: MessageGif;
       reply_to?: ReplyPreview;
     }
+  | { type: "message_edited"; id: string; room_id: string; content: string; edited_at: string }
   | { type: "message_ack"; id: string; client_id: string; sent_at: string }
   | { type: "message_error"; client_id: string }
   | { type: "typing"; user_id: string; pseudo: string }
@@ -435,6 +456,7 @@ export type WsNotification =
       gif?: MessageGif;
       reply_to?: ReplyPreview;
     }
+  | { type: "message_edited"; id: string; room_id: string; content: string; edited_at: string }
   | { type: "invitation"; room_id: string }
   | { type: "room_removed"; room_id: string }
   | { type: "room_read"; room_id: string }
