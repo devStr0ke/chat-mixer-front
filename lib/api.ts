@@ -376,6 +376,38 @@ export function deleteInvitation(invitationId: string) {
   });
 }
 
+/** What a linked page says about itself, as fetched by our server. */
+export interface LinkPreview {
+  url: string;
+  title: string;
+  description: string;
+  site_name: string;
+  image_id: string | null;
+  image_width: number;
+  image_height: number;
+}
+
+const linkPreviewCache = new Map<string, Promise<LinkPreview | null>>();
+
+/** Preview card data for a URL, or null when the page has none. Deduplicated per session. */
+export function getLinkPreview(url: string): Promise<LinkPreview | null> {
+  let pending = linkPreviewCache.get(url);
+  if (!pending) {
+    pending = apiFetch<LinkPreview>(`/link-preview?url=${encodeURIComponent(url)}`).catch((err) => {
+      // "no preview" is a final answer; anything else (rate limit, network) may work later
+      if ((err as { status?: number }).status !== 404) linkPreviewCache.delete(url);
+      return null;
+    });
+    linkPreviewCache.set(url, pending);
+  }
+  return pending;
+}
+
+/** Our own copy of the page's preview image (same-origin, so the auth cookie goes along). */
+export function linkPreviewImageUrl(imageId: string) {
+  return `${HTTP_BASE}/link-previews/images/${imageId}`;
+}
+
 export const ACCEPTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;

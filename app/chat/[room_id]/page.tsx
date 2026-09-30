@@ -33,6 +33,9 @@ import { Lightbox } from "@/components/Lightbox";
 import { PendingUploads } from "@/components/PendingUploads";
 import { RoomAppearancePanel } from "@/components/RoomAppearancePanel";
 import { EditHistoryDialog } from "@/components/EditHistoryDialog";
+import { MessageText } from "@/components/MessageText";
+import { LinkPreviewCard } from "@/components/LinkPreviewCard";
+import { firstLink } from "@/lib/links";
 import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
 import { resolveTheme } from "@/lib/theme";
 
@@ -535,6 +538,13 @@ export default function ChatPage() {
     }
     // the composer growing (reply bar, image previews) shrinks the list: same rule applies
   }, [messages, typingCount, composerExtras]);
+
+  // content that grows after render (a link card loading) shouldn't push the
+  // newest messages out of view
+  const repinToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (el && nearBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, []);
 
   const loadOlder = useCallback(async () => {
     const oldest = messagesRef.current.find((m) => !m.status);
@@ -1168,6 +1178,8 @@ export default function ChatPage() {
           const reactionGroups = groupReactions(msg.reactions, user.id);
           const media = mediaOf(msg);
           const hasAttachments = media.length > 0;
+          // one card per message, and not on top of images or a GIF
+          const previewUrl = hasAttachments ? null : firstLink(msg.content);
 
           return (
             <div key={msg.client_id ?? msg.id} data-message-id={msg.id}>
@@ -1185,7 +1197,7 @@ export default function ChatPage() {
                     {showSender && <Avatar user={senderOf(msg)} size={28} />}
                   </div>
                 )}
-                <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
+                <div className={`relative min-w-0 max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
                   {showSender && (
                     <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id, look.onLight)}`}>
                       {msg.sender_pseudo}
@@ -1194,7 +1206,7 @@ export default function ChatPage() {
                   <div className="relative">
                     <div
                       style={isOwn ? look.ownBubble : look.otherBubble}
-                      className={`rounded-2xl text-sm break-words select-none touch-manipulation transition-shadow duration-300 ${
+                      className={`rounded-2xl text-sm wrap-anywhere select-none touch-manipulation transition-shadow duration-300 ${
                         hasAttachments ? "p-1" : "px-4 py-2"
                       } ${isOwn ? "rounded-br-md" : "rounded-bl-md"} ${msg.status === "failed" ? "opacity-60" : ""} ${
                         highlightId === msg.id ? "ring-2 ring-amber-300" : ""
@@ -1248,7 +1260,7 @@ export default function ChatPage() {
                           <span className="block truncate text-[11px] font-semibold opacity-90">
                             {msg.reply_to.sender_id === user.id ? "You" : msg.reply_to.sender_pseudo}
                           </span>
-                          <span className="block break-words text-xs opacity-75 line-clamp-2">
+                          <span className="break-words text-xs opacity-75 line-clamp-2">
                             {replySnippet(msg.reply_to)}
                           </span>
                         </button>
@@ -1256,9 +1268,8 @@ export default function ChatPage() {
                       {hasAttachments && (
                         <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />
                       )}
-                      {msg.content && (
-                        <p className={`whitespace-pre-wrap ${hasAttachments ? "px-3 pt-1.5" : ""}`}>{msg.content}</p>
-                      )}
+                      {msg.content && <MessageText text={msg.content} className={hasAttachments ? "px-3 pt-1.5" : ""} />}
+                      {previewUrl && <LinkPreviewCard url={previewUrl} onShown={repinToBottom} />}
                       <div
                         className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""} ${
                           hasAttachments ? "px-3 pb-1" : ""
