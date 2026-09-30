@@ -955,17 +955,15 @@ export default function ChatPage() {
                       Rename room
                     </button>
                   )}
-                  {isOwner && (
-                    <button
-                      onClick={() => {
-                        setShowAppearance(true);
-                        setShowMenu(false);
-                      }}
-                      className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
-                    >
-                      Appearance
-                    </button>
-                  )}
+                  <button
+                    onClick={() => {
+                      setShowAppearance(true);
+                      setShowMenu(false);
+                    }}
+                    className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
+                  >
+                    Appearance
+                  </button>
                   <button
                     onClick={() => {
                       setShowMenu(false);

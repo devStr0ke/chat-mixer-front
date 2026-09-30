@@ -60,7 +60,7 @@ function ColorField({
 }
 
 /**
- * Slide-over where the room owner picks the room's look: background color or
+ * Slide-over where any member picks the room's look: background color or
  * image and bubble colors. Everyone in the room sees the result.
  */
 export function RoomAppearancePanel({
@@ -178,7 +178,7 @@ export function RoomAppearancePanel({
                 Today
               </p>
             </div>
-            <p className="text-xs text-neutral-500">Everyone in the room sees this look.</p>
+            <p className="text-xs text-neutral-500">Everyone in the room sees this look, and any member can change it.</p>
           </section>
 
           <section className="space-y-2">
