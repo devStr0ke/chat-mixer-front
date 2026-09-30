@@ -19,6 +19,7 @@ import {
   type Reaction,
   type Gif,
   type MessageGif,
+  type ReplyPreview,
   type WsOutgoing,
   type WsIncoming,
 } from "@/lib/api";
@@ -29,7 +30,9 @@ import { Avatar } from "@/components/Avatar";
 import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentGrid";
 import { Lightbox } from "@/components/Lightbox";
 import { PendingUploads } from "@/components/PendingUploads";
+import { RoomAppearancePanel } from "@/components/RoomAppearancePanel";
 import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
+import { resolveTheme } from "@/lib/theme";
 
 // loaded on first use: most visits never open the picker
 const EmojiPickerPanel = dynamic(() => import("@/components/EmojiPickerPanel").then((m) => m.EmojiPickerPanel), {
@@ -62,6 +65,25 @@ const MAX_MESSAGE_LENGTH = 2000;
 
 function isStatus(err: unknown, status: number): boolean {
   return (err as { status?: number } | null)?.status === status;
+}
+
+/** The quote a reply to this message carries (same shape the server builds). */
+function replyPreviewOf(msg: ChatMessage): ReplyPreview {
+  return {
+    id: msg.id,
+    sender_id: msg.sender_id,
+    sender_pseudo: msg.sender_pseudo,
+    content: msg.content.slice(0, 140),
+    attachment_count: msg.attachments.length,
+    has_gif: !!msg.gif,
+  };
+}
+
+/** One-line description of a quoted message. */
+function replySnippet(reply: ReplyPreview): string {
+  if (reply.content) return reply.content;
+  if (reply.has_gif) return "GIF";
+  return reply.attachment_count > 1 ? `📷 ${reply.attachment_count} photos` : "📷 Photo";
 }
 
 /** What a message shows as images: its GIF, or its uploaded attachments. */
@@ -114,6 +136,10 @@ export default function ChatPage() {
   const [panel, setPanel] = useState<"emoji" | "gif" | null>(null);
   // message id the full emoji picker is reacting to
   const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
+  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  // briefly highlighted after jumping to it from a reply's quote
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [showAppearance, setShowAppearance] = useState(false);
   const [dragging, setDragging] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -132,6 +158,9 @@ export default function ChatPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   // last caret position in the message box, so emojis land where the user was typing
   const caretRef = useRef<{ start: number; end: number } | null>(null);
+  // message to scroll to once the older pages containing it have rendered
+  const pendingJumpRef = useRef<string | null>(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragDepthRef = useRef(0);
 
   const composer = useAttachmentUploads(room_id, setError);
@@ -154,6 +183,7 @@ export default function ChatPage() {
     setRemoved(true);
     setConnState("closed");
     setShowMembers(false);
+    setShowAppearance(false);
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -282,6 +312,7 @@ export default function ChatPage() {
               reactions: [],
               attachments: incoming.attachments ?? [],
               gif: incoming.gif ?? null,
+              reply_to: incoming.reply_to ?? null,
             };
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
@@ -442,6 +473,20 @@ export default function ChatPage() {
   }, [panel, reactionPickerFor]);
 
   const typingCount = Object.keys(typingUsers).length;
+  const composerExtras = (replyTo ? 1 : 0) + composer.uploads.length;
+
+  function scrollToMessage(id: string): boolean {
+    const target = scrollRef.current?.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
+    if (!target) return false;
+    target.scrollIntoView({ block: "center" });
+    return true;
+  }
+
+  function flashMessage(id: string) {
+    setHighlightId(id);
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = setTimeout(() => setHighlightId(null), 1600);
+  }
 
   // Keep the view pinned: jump to the bottom on load/send, follow new messages
   // when already near the bottom, and hold position when older ones are prepended.
@@ -450,12 +495,19 @@ export default function ChatPage() {
     if (!el) return;
     const mode = scrollModeRef.current;
     scrollModeRef.current = "none";
+    if (pendingJumpRef.current) {
+      const id = pendingJumpRef.current;
+      pendingJumpRef.current = null;
+      if (scrollToMessage(id)) setTimeout(() => flashMessage(id), 0);
+      return;
+    }
     if (mode === "restore") {
       el.scrollTop = restoreRef.current.top + (el.scrollHeight - restoreRef.current.height);
     } else if (mode === "bottom" || nearBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages, typingCount]);
+    // the composer growing (reply bar, image previews) shrinks the list: same rule applies
+  }, [messages, typingCount, composerExtras]);
 
   const loadOlder = useCallback(async () => {
     const oldest = messagesRef.current.find((m) => !m.status);
@@ -490,7 +542,12 @@ export default function ChatPage() {
     }
   }
 
-  function sendContent(text: string, attachments: DisplayAttachment[] = [], gif: MessageGif | null = null) {
+  function sendContent(
+    text: string,
+    attachments: DisplayAttachment[] = [],
+    gif: MessageGif | null = null,
+    reply: ReplyPreview | null = null
+  ) {
     if (!user) return;
     localIdRef.current += 1;
     const clientId = `local-${Date.now()}-${localIdRef.current}`;
@@ -500,6 +557,7 @@ export default function ChatPage() {
       client_id: clientId,
       ...(attachments.length > 0 && { attachment_ids: attachments.map((a) => a.id) }),
       ...(gif && { gif_id: gif.id }),
+      ...(reply && { reply_to_id: reply.id }),
     });
     const localMsg: ChatMessage = {
       id: clientId,
@@ -512,6 +570,7 @@ export default function ChatPage() {
       reactions: [],
       attachments,
       gif,
+      reply_to: reply,
     };
     scrollModeRef.current = "bottom";
     setMessages((prev) => [...prev, localMsg]);
@@ -522,7 +581,7 @@ export default function ChatPage() {
     const text = input.trim();
     if (composer.blocked || (!text && composer.ready === 0)) return;
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-    sendContent(text, composer.take());
+    sendContent(text, composer.take(), null, takeReply());
     setInput("");
     caretRef.current = null;
     setPanel(null);
@@ -533,13 +592,62 @@ export default function ChatPage() {
   function handleRetry(msg: ChatMessage) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-    sendContent(msg.content, msg.attachments, msg.gif);
+    sendContent(msg.content, msg.attachments, msg.gif, msg.reply_to);
+  }
+
+  /** The quote for the message being composed; sending it ends the reply. */
+  function takeReply(): ReplyPreview | null {
+    if (!replyTo) return null;
+    setReplyTo(null);
+    return replyPreviewOf(replyTo);
+  }
+
+  function startReply(msg: ChatMessage) {
+    setContextMsg(null);
+    setPicker(null);
+    setReplyTo(msg);
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }
+
+  async function jumpToMessage(id: string) {
+    if (holdFiredRef.current) {
+      holdFiredRef.current = false;
+      return;
+    }
+    if (scrollToMessage(id)) {
+      flashMessage(id);
+      return;
+    }
+
+    // the quoted message is older than what's loaded: page back until it shows up
+    let oldest = messagesRef.current.find((m) => !m.status)?.id;
+    let more = hasMore;
+    const older: Message[] = [];
+    try {
+      for (let i = 0; i < 10 && more && oldest; i++) {
+        const page = await getRoomMessages(room_id, oldest);
+        older.unshift(...page.messages);
+        more = page.has_more;
+        oldest = page.messages[0]?.id;
+        if (page.messages.some((m) => m.id === id)) break;
+      }
+    } catch {
+      return;
+    }
+    if (older.length === 0) return;
+
+    pendingJumpRef.current = id;
+    setMessages((prev) => {
+      const known = new Set(prev.map((m) => m.id));
+      return [...older.filter((m) => !known.has(m.id)), ...prev];
+    });
+    setHasMore(more);
   }
 
   // picking a GIF sends it straight away, like other chat apps
   function sendGif(gif: Gif) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-    sendContent("", [], { id: gif.id, url: gif.url, width: gif.width, height: gif.height });
+    sendContent("", [], { id: gif.id, url: gif.url, width: gif.width, height: gif.height }, takeReply());
     setPanel(null);
   }
 
@@ -737,6 +845,7 @@ export default function ChatPage() {
   }
 
   const isOwner = room.owner_id === user.id;
+  const look = resolveTheme(room.id, room.theme);
   const otherMembers = room.members.filter((m) => m.id !== user.id);
   const memberById = new Map(room.members.map((m) => [m.id, m]));
   const typingEntries = Object.entries(typingUsers);
@@ -846,6 +955,17 @@ export default function ChatPage() {
                       Rename room
                     </button>
                   )}
+                  {isOwner && (
+                    <button
+                      onClick={() => {
+                        setShowAppearance(true);
+                        setShowMenu(false);
+                      }}
+                      className="w-full text-left px-4 py-2.5 text-sm text-neutral-300 hover:bg-neutral-800 transition"
+                    >
+                      Appearance
+                    </button>
+                  )}
                   <button
                     onClick={() => {
                       setShowMenu(false);
@@ -915,14 +1035,15 @@ export default function ChatPage() {
         onScroll={handleScroll}
         onClick={() => setShowMenu(false)}
         className="flex-1 overflow-y-auto px-4 py-4"
-        style={{ scrollBehavior: "auto" }}
+        style={{ scrollBehavior: "auto", ...look.container }}
       >
         {hasMore && (
           <div className="flex justify-center pb-3">
             <button
               onClick={loadOlder}
               disabled={loadingOlder}
-              className="text-xs text-neutral-500 hover:text-neutral-300 transition disabled:opacity-60"
+              style={{ color: look.muted }}
+              className="text-xs hover:opacity-80 transition disabled:opacity-60"
             >
               {loadingOlder ? "Loading…" : "Load earlier messages"}
             </button>
@@ -933,7 +1054,9 @@ export default function ChatPage() {
           <div className="flex flex-col items-center justify-center h-full gap-3 text-center">
             {otherMembers.length === 0 ? (
               <>
-                <p className="text-sm text-neutral-500">It&apos;s just you in here for now.</p>
+                <p className="text-sm" style={{ color: look.muted }}>
+                  It&apos;s just you in here for now.
+                </p>
                 <button
                   onClick={() => setShowMembers(true)}
                   className="px-4 py-2 text-sm font-medium bg-violet-600 hover:bg-violet-500 text-white rounded-xl transition"
@@ -942,7 +1065,9 @@ export default function ChatPage() {
                 </button>
               </>
             ) : (
-              <p className="text-sm text-neutral-600">No messages yet. Say hi 👋</p>
+              <p className="text-sm" style={{ color: look.muted }}>
+                No messages yet. Say hi 👋
+              </p>
             )}
           </div>
         )}
@@ -960,12 +1085,12 @@ export default function ChatPage() {
           const hasAttachments = media.length > 0;
 
           return (
-            <div key={msg.client_id ?? msg.id}>
+            <div key={msg.client_id ?? msg.id} data-message-id={msg.id}>
               {newDay && (
-                <div className="flex items-center gap-3 my-4">
-                  <span className="flex-1 h-px bg-neutral-800" />
-                  <span className="text-[11px] font-medium text-neutral-500">{formatDay(msg.sent_at)}</span>
-                  <span className="flex-1 h-px bg-neutral-800" />
+                <div className="flex items-center gap-3 my-4" style={{ color: look.muted }}>
+                  <span className="flex-1 h-px bg-current opacity-25" />
+                  <span className="text-[11px] font-medium">{formatDay(msg.sent_at)}</span>
+                  <span className="flex-1 h-px bg-current opacity-25" />
                 </div>
               )}
 
@@ -977,18 +1102,17 @@ export default function ChatPage() {
                 )}
                 <div className={`relative max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
                   {showSender && (
-                    <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id)}`}>
+                    <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id, look.onLight)}`}>
                       {msg.sender_pseudo}
                     </span>
                   )}
                   <div className="relative">
                     <div
-                      className={`rounded-2xl text-sm break-words select-none touch-manipulation ${
+                      style={isOwn ? look.ownBubble : look.otherBubble}
+                      className={`rounded-2xl text-sm break-words select-none touch-manipulation transition-shadow duration-300 ${
                         hasAttachments ? "p-1" : "px-4 py-2"
-                      } ${
-                        isOwn
-                          ? `bg-violet-600 text-white rounded-br-md ${msg.status === "failed" ? "opacity-60" : ""}`
-                          : "bg-neutral-800 text-neutral-100 rounded-bl-md"
+                      } ${isOwn ? "rounded-br-md" : "rounded-bl-md"} ${msg.status === "failed" ? "opacity-60" : ""} ${
+                        highlightId === msg.id ? "ring-2 ring-amber-300" : ""
                       }`}
                       onPointerDown={(e) => {
                         e.stopPropagation();
@@ -1027,6 +1151,23 @@ export default function ChatPage() {
                         togglePicker(msg.id, e.currentTarget);
                       }}
                     >
+                      {msg.reply_to && (
+                        <button
+                          type="button"
+                          onClick={() => jumpToMessage(msg.reply_to!.id)}
+                          title="Go to the original message"
+                          className={`block w-full rounded-lg border-l-2 border-current bg-black/15 px-2.5 py-1.5 text-left ${
+                            hasAttachments ? "mb-1" : "mb-1.5"
+                          }`}
+                        >
+                          <span className="block truncate text-[11px] font-semibold opacity-90">
+                            {msg.reply_to.sender_id === user.id ? "You" : msg.reply_to.sender_pseudo}
+                          </span>
+                          <span className="block break-words text-xs opacity-75 line-clamp-2">
+                            {replySnippet(msg.reply_to)}
+                          </span>
+                        </button>
+                      )}
                       {hasAttachments && (
                         <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />
                       )}
@@ -1038,12 +1179,10 @@ export default function ChatPage() {
                           hasAttachments ? "px-3 pb-1" : ""
                         }`}
                       >
-                        <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
-                          {formatTime(msg.sent_at)}
-                        </span>
+                        <span className="text-[10px] opacity-70">{formatTime(msg.sent_at)}</span>
                         {isOwn && confirmed && (
                           <svg
-                            className={`w-3.5 h-3.5 ${seenByAll ? "text-violet-200" : "text-violet-400/60"}`}
+                            className={`w-3.5 h-3.5 ${seenByAll ? "opacity-90" : "opacity-45"}`}
                             fill="none"
                             stroke="currentColor"
                             viewBox="0 0 24 24"
@@ -1056,7 +1195,7 @@ export default function ChatPage() {
                           </svg>
                         )}
                         {msg.status === "pending" && (
-                          <svg className="w-3 h-3 text-violet-300/70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <svg className="w-3 h-3 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <circle cx="12" cy="12" r="9" strokeWidth={2} />
                             <path strokeLinecap="round" strokeWidth={2} d="M12 7v5l3 2" />
                           </svg>
@@ -1065,23 +1204,36 @@ export default function ChatPage() {
                     </div>
 
                     {confirmed && (
-                      <button
-                        type="button"
-                        data-reaction-picker
-                        onClick={(e) => togglePicker(msg.id, e.currentTarget)}
-                        title="Add reaction (or double-click the message for ❤️)"
-                        aria-label="Add reaction"
-                        className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 ${
-                          isOwn ? "right-full mr-1.5" : "left-full ml-1.5"
-                        } w-7 h-7 items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition focus-visible:opacity-100 ${
-                          picker?.id === msg.id ? "opacity-100 text-neutral-200 bg-neutral-800" : "opacity-0 group-hover:opacity-100"
-                        }`}
+                      <div
+                        className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 items-center gap-0.5 transition focus-within:opacity-100 ${
+                          isOwn ? "right-full mr-1.5 flex-row-reverse" : "left-full ml-1.5"
+                        } ${picker?.id === msg.id ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
                       >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                          <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
-                        </svg>
-                      </button>
+                        <button
+                          type="button"
+                          data-reaction-picker
+                          onClick={(e) => togglePicker(msg.id, e.currentTarget)}
+                          title="Add reaction (or double-click the message for ❤️)"
+                          aria-label="Add reaction"
+                          className={`w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition ${
+                            picker?.id === msg.id ? "text-neutral-200 bg-neutral-800" : ""
+                          }`}
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                            <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => startReply(msg)}
+                          title="Reply"
+                          aria-label="Reply"
+                          className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                        >
+                          <ReplyIcon className="w-4 h-4" />
+                        </button>
+                      </div>
                     )}
 
                     {picker?.id === msg.id && (
@@ -1136,7 +1288,7 @@ export default function ChatPage() {
                   )}
 
                   {msg === lastOwnSent && lastOwnSeenBy.length > 0 && (
-                    <span className="mt-1 text-[10px] text-neutral-500">
+                    <span className="mt-1 text-[10px]" style={{ color: look.muted }}>
                       {seenByAll && otherMembers.length > 1
                         ? "Seen by everyone"
                         : `Seen by ${lastOwnSeenBy.map((m) => m.pseudo).join(", ")}`}
@@ -1157,18 +1309,18 @@ export default function ChatPage() {
               <span className="text-[11px] font-medium mb-0.5 ml-1">
                 {typingEntries.map(([id, pseudo], i) => (
                   <Fragment key={id}>
-                    {i > 0 && <span className="text-neutral-500">, </span>}
-                    <span className={nameColor(id)}>{pseudo}</span>
+                    {i > 0 && <span style={{ color: look.muted }}>, </span>}
+                    <span className={nameColor(id, look.onLight)}>{pseudo}</span>
                   </Fragment>
                 ))}
-                <span className="text-neutral-500">
+                <span style={{ color: look.muted }}>
                   {typingEntries.length === 1 ? " is typing" : " are typing"}
                 </span>
               </span>
-              <div className="bg-neutral-800 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:0ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:150ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:300ms]" />
+              <div className="rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1" style={look.otherBubble}>
+                <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:0ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:150ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:300ms]" />
               </div>
             </div>
           </div>
@@ -1200,6 +1352,25 @@ export default function ChatPage() {
             </div>
           )}
           <form onSubmit={handleSend} className="border-t border-neutral-800">
+            {replyTo && (
+              <div className="flex items-center gap-3 px-4 pt-3">
+                <ReplyIcon className="w-4 h-4 flex-shrink-0 text-violet-400" />
+                <div className="min-w-0 flex-1 border-l-2 border-violet-500 pl-2.5">
+                  <p className="truncate text-xs font-medium text-violet-300">
+                    Replying to {replyTo.sender_id === user.id ? "yourself" : replyTo.sender_pseudo}
+                  </p>
+                  <p className="truncate text-xs text-neutral-400">{replySnippet(replyPreviewOf(replyTo))}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setReplyTo(null)}
+                  className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-neutral-500 transition hover:bg-neutral-800 hover:text-neutral-200"
+                  aria-label="Cancel reply"
+                >
+                  ×
+                </button>
+              </div>
+            )}
             <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
             <div className="px-3 sm:px-4 py-3 flex items-center gap-1 sm:gap-2">
               <input
@@ -1269,6 +1440,9 @@ export default function ChatPage() {
                 }}
                 onSelect={saveCaret}
                 onKeyUp={saveCaret}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && replyTo) setReplyTo(null);
+                }}
                 onClick={saveCaret}
                 placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
                 disabled={connState !== "open"}
@@ -1312,6 +1486,14 @@ export default function ChatPage() {
         </div>
       )}
 
+      {showAppearance && (
+        <RoomAppearancePanel
+          room={room}
+          onClose={() => setShowAppearance(false)}
+          onChanged={(theme) => setRoom((prev) => prev && { ...prev, theme })}
+        />
+      )}
+
       {showMembers && (
         <MembersPanel
           room={room}
@@ -1335,17 +1517,12 @@ export default function ChatPage() {
           >
             {/* Frozen bubble */}
             <div
+              style={isOwn ? look.ownBubble : look.otherBubble}
               className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm pointer-events-none ${
-                isOwn
-                  ? "bg-violet-600 text-white rounded-br-md self-end"
-                  : "bg-neutral-800 text-neutral-100 rounded-bl-md self-start"
+                isOwn ? "rounded-br-md self-end" : "rounded-bl-md self-start"
               }`}
             >
-              {!isOwn && (
-                <p className={`text-[11px] font-medium mb-0.5 ${nameColor(contextMsg.sender_id)}`}>
-                  {contextMsg.sender_pseudo}
-                </p>
-              )}
+              {!isOwn && <p className="text-[11px] font-semibold mb-0.5 opacity-80">{contextMsg.sender_pseudo}</p>}
               <p className="whitespace-pre-wrap">
                 {contextMsg.content ||
                   (contextMsg.gif
@@ -1355,9 +1532,7 @@ export default function ChatPage() {
                       : "📷 Photo")}
               </p>
               <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
-                <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>
-                  {formatTime(contextMsg.sent_at)}
-                </span>
+                <span className="text-[10px] opacity-70">{formatTime(contextMsg.sent_at)}</span>
               </div>
             </div>
 
@@ -1372,10 +1547,30 @@ export default function ChatPage() {
                 }}
               />
             </div>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                startReply(contextMsg);
+              }}
+              className="flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
+            >
+              <ReplyIcon className="w-4 h-4" />
+              Reply
+            </button>
           </div>
         );
       })()}
     </div>
+  );
+}
+
+function ReplyIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 14L4 9l5-5M4 9h10a6 6 0 016 6v4" />
+    </svg>
   );
 }
 

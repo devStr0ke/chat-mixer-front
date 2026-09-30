@@ -173,7 +173,18 @@ export interface Member extends UserSummary {
   last_read_at: string;
 }
 
+/** A room's custom look. Null fields use the app's defaults. */
+export interface RoomTheme {
+  background_color: string | null;
+  background_image_id: string | null;
+  bubble_own_color: string | null;
+  bubble_other_color: string | null;
+}
+
+export type RoomThemeColors = Omit<RoomTheme, "background_image_id">;
+
 export interface RoomDetail extends Room {
+  theme: RoomTheme;
   members: Member[];
 }
 
@@ -228,6 +239,17 @@ export interface Message {
   reactions: Reaction[];
   attachments: Attachment[];
   gif: MessageGif | null;
+  reply_to: ReplyPreview | null;
+}
+
+/** The quoted message shown inside a reply (its text is truncated by the server). */
+export interface ReplyPreview {
+  id: string;
+  sender_id: string;
+  sender_pseudo: string;
+  content: string;
+  attachment_count: number;
+  has_gif: boolean;
 }
 
 export interface MessagePage {
@@ -269,6 +291,28 @@ export function renameRoom(roomId: string, name: string) {
     method: "PATCH",
     body: JSON.stringify({ name }),
   });
+}
+
+export function updateRoomTheme(roomId: string, colors: RoomThemeColors) {
+  return apiFetch<RoomTheme>(`/rooms/${roomId}/theme`, {
+    method: "PATCH",
+    body: JSON.stringify(colors),
+  });
+}
+
+export function uploadRoomBackground(roomId: string, file: Blob, filename: string) {
+  const form = new FormData();
+  form.append("file", file, filename);
+  return apiFetch<RoomTheme>(`/rooms/${roomId}/background`, { method: "PUT", body: form });
+}
+
+export function deleteRoomBackground(roomId: string) {
+  return apiFetch<RoomTheme>(`/rooms/${roomId}/background`, { method: "DELETE" });
+}
+
+/** Same-origin URL, so the auth cookie goes along when CSS loads it. */
+export function roomBackgroundUrl(roomId: string, imageId: string) {
+  return `${HTTP_BASE}/rooms/${roomId}/background/${imageId}`;
 }
 
 export function deleteRoom(roomId: string) {
@@ -344,7 +388,14 @@ export function removeReaction(messageId: string) {
 }
 
 export type WsOutgoing =
-  | { type: "message"; content: string; client_id: string; attachment_ids?: string[]; gif_id?: string }
+  | {
+      type: "message";
+      content: string;
+      client_id: string;
+      attachment_ids?: string[];
+      gif_id?: string;
+      reply_to_id?: string;
+    }
   | { type: "typing" }
   | { type: "read"; id: string };
 
@@ -359,6 +410,7 @@ export type WsIncoming =
       sent_at: string;
       attachments?: Attachment[];
       gif?: MessageGif;
+      reply_to?: ReplyPreview;
     }
   | { type: "message_ack"; id: string; client_id: string; sent_at: string }
   | { type: "message_error"; client_id: string }
@@ -381,6 +433,7 @@ export type WsNotification =
       sent_at: string;
       attachments?: Attachment[];
       gif?: MessageGif;
+      reply_to?: ReplyPreview;
     }
   | { type: "invitation"; room_id: string }
   | { type: "room_removed"; room_id: string }

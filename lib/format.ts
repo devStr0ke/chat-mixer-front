@@ -47,9 +47,22 @@ const NAME_COLORS = [
   "text-orange-300",
 ];
 
+// same hues, dark enough to read on a light room background
+const NAME_COLORS_ON_LIGHT = [
+  "text-sky-700",
+  "text-emerald-700",
+  "text-amber-700",
+  "text-rose-700",
+  "text-cyan-700",
+  "text-fuchsia-700",
+  "text-lime-700",
+  "text-orange-700",
+];
+
 /** Stable per-user color for sender names in group conversations. */
-export function nameColor(userId: string): string {
+export function nameColor(userId: string, onLight = false): string {
   let h = 0;
   for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) | 0;
-  return NAME_COLORS[Math.abs(h) % NAME_COLORS.length];
+  const palette = onLight ? NAME_COLORS_ON_LIGHT : NAME_COLORS;
+  return palette[Math.abs(h) % palette.length];
 }
