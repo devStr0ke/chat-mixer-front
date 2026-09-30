@@ -60,6 +60,7 @@ export function Lightbox({
       <img
         src={attachmentSrc(attachment)}
         alt=""
+        referrerPolicy="no-referrer"
         onClick={(e) => e.stopPropagation()}
         className="max-w-[92vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
       />

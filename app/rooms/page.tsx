@@ -109,6 +109,7 @@ export default function RoomsPage() {
                     sender_pseudo: msg.sender_pseudo,
                     content: msg.content ?? "",
                     attachment_count: msg.attachments?.length ?? 0,
+                    has_gif: !!msg.gif,
                     sent_at: msg.sent_at,
                   },
                 };
@@ -196,7 +197,7 @@ export default function RoomsPage() {
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
     const photos =
       last.attachment_count > 1 ? `📷 ${last.attachment_count} photos` : last.attachment_count === 1 ? "📷 Photo" : "";
-    return `${who}: ${last.content || photos}`;
+    return `${who}: ${last.content || (last.has_gif ? "GIF" : photos)}`;
   }
 
   return (

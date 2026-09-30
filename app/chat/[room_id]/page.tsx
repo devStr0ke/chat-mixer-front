@@ -17,6 +17,8 @@ import {
   type Member,
   type Message,
   type Reaction,
+  type Gif,
+  type MessageGif,
   type WsOutgoing,
   type WsIncoming,
 } from "@/lib/api";
@@ -31,6 +33,11 @@ import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
 
 // loaded on first use: most visits never open the picker
 const EmojiPickerPanel = dynamic(() => import("@/components/EmojiPickerPanel").then((m) => m.EmojiPickerPanel), {
+  ssr: false,
+  loading: () => <div className="h-[380px] w-[302px] rounded-2xl border border-neutral-700 bg-neutral-900 shadow-2xl" />,
+});
+
+const GifPicker = dynamic(() => import("@/components/GifPicker").then((m) => m.GifPicker), {
   ssr: false,
   loading: () => <div className="h-[380px] w-[302px] rounded-2xl border border-neutral-700 bg-neutral-900 shadow-2xl" />,
 });
@@ -55,6 +62,13 @@ const MAX_MESSAGE_LENGTH = 2000;
 
 function isStatus(err: unknown, status: number): boolean {
   return (err as { status?: number } | null)?.status === status;
+}
+
+/** What a message shows as images: its GIF, or its uploaded attachments. */
+function mediaOf(msg: ChatMessage): DisplayAttachment[] {
+  if (!msg.gif) return msg.attachments;
+  const { id, url, width, height } = msg.gif;
+  return [{ id: `gif-${id}`, content_type: "image/gif", width, height, size: 0, preview_url: url }];
 }
 
 /** Merges fetched messages into the local list by id, keeping chronological order. */
@@ -97,7 +111,7 @@ export default function ChatPage() {
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
   const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
-  const [showEmoji, setShowEmoji] = useState(false);
+  const [panel, setPanel] = useState<"emoji" | "gif" | null>(null);
   // message id the full emoji picker is reacting to
   const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -121,6 +135,8 @@ export default function ChatPage() {
   const dragDepthRef = useRef(0);
 
   const composer = useAttachmentUploads(room_id, setError);
+  // desktop: focus the GIF search on open; on touch that would pop the keyboard
+  const [pointerFine] = useState(() => typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches);
   const messagesRef = useRef<ChatMessage[]>([]);
   const nearBottomRef = useRef(true);
   const lastReadSentRef = useRef<string | null>(null);
@@ -265,6 +281,7 @@ export default function ChatPage() {
               sent_at: incoming.sent_at,
               reactions: [],
               attachments: incoming.attachments ?? [],
+              gif: incoming.gif ?? null,
             };
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
@@ -407,13 +424,13 @@ export default function ChatPage() {
   }, [picker]);
 
   useEffect(() => {
-    if (!showEmoji && !reactionPickerFor) return;
+    if (!panel && !reactionPickerFor) return;
     function handleMouseDown(e: MouseEvent) {
-      if (!(e.target as Element).closest("[data-emoji-picker]")) setShowEmoji(false);
+      if (!(e.target as Element).closest("[data-composer-panel]")) setPanel(null);
     }
     function handleKey(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
-      setShowEmoji(false);
+      setPanel(null);
       setReactionPickerFor(null);
     }
     document.addEventListener("mousedown", handleMouseDown);
@@ -422,7 +439,7 @@ export default function ChatPage() {
       document.removeEventListener("mousedown", handleMouseDown);
       document.removeEventListener("keydown", handleKey);
     };
-  }, [showEmoji, reactionPickerFor]);
+  }, [panel, reactionPickerFor]);
 
   const typingCount = Object.keys(typingUsers).length;
 
@@ -473,7 +490,7 @@ export default function ChatPage() {
     }
   }
 
-  function sendContent(text: string, attachments: DisplayAttachment[] = []) {
+  function sendContent(text: string, attachments: DisplayAttachment[] = [], gif: MessageGif | null = null) {
     if (!user) return;
     localIdRef.current += 1;
     const clientId = `local-${Date.now()}-${localIdRef.current}`;
@@ -482,6 +499,7 @@ export default function ChatPage() {
       content: text,
       client_id: clientId,
       ...(attachments.length > 0 && { attachment_ids: attachments.map((a) => a.id) }),
+      ...(gif && { gif_id: gif.id }),
     });
     const localMsg: ChatMessage = {
       id: clientId,
@@ -493,6 +511,7 @@ export default function ChatPage() {
       sent_at: new Date().toISOString(),
       reactions: [],
       attachments,
+      gif,
     };
     scrollModeRef.current = "bottom";
     setMessages((prev) => [...prev, localMsg]);
@@ -506,7 +525,7 @@ export default function ChatPage() {
     sendContent(text, composer.take());
     setInput("");
     caretRef.current = null;
-    setShowEmoji(false);
+    setPanel(null);
     lastTypingSentRef.current = 0;
     inputRef.current?.focus();
   }
@@ -514,7 +533,14 @@ export default function ChatPage() {
   function handleRetry(msg: ChatMessage) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-    sendContent(msg.content, msg.attachments);
+    sendContent(msg.content, msg.attachments, msg.gif);
+  }
+
+  // picking a GIF sends it straight away, like other chat apps
+  function sendGif(gif: Gif) {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    sendContent("", [], { id: gif.id, url: gif.url, width: gif.width, height: gif.height });
+    setPanel(null);
   }
 
   function imageFiles(list: FileList | null | undefined): File[] {
@@ -553,7 +579,7 @@ export default function ChatPage() {
       holdFiredRef.current = false;
       return;
     }
-    setLightbox({ items: msg.attachments, index });
+    setLightbox({ items: mediaOf(msg), index });
   }
 
   function saveCaret(e: React.SyntheticEvent<HTMLInputElement>) {
@@ -930,7 +956,8 @@ export default function ChatPage() {
           const seen = isOwn && confirmed ? seenBy(msg) : [];
           const seenByAll = otherMembers.length > 0 && seen.length === otherMembers.length;
           const reactionGroups = groupReactions(msg.reactions, user.id);
-          const hasAttachments = msg.attachments.length > 0;
+          const media = mediaOf(msg);
+          const hasAttachments = media.length > 0;
 
           return (
             <div key={msg.client_id ?? msg.id}>
@@ -1001,7 +1028,7 @@ export default function ChatPage() {
                       }}
                     >
                       {hasAttachments && (
-                        <AttachmentGrid attachments={msg.attachments} onOpen={(i) => openLightbox(msg, i)} />
+                        <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />
                       )}
                       {msg.content && (
                         <p className={`whitespace-pre-wrap ${hasAttachments ? "px-3 pt-1.5" : ""}`}>{msg.content}</p>
@@ -1163,14 +1190,18 @@ export default function ChatPage() {
       ) : (
         <div className="relative flex-shrink-0">
           {/* outside the form: a button in there would submit the message */}
-          {showEmoji && (
-            <div data-emoji-picker className="absolute bottom-full left-2 z-40 mb-2 max-w-[calc(100%-1rem)]">
-              <EmojiPickerPanel onSelect={insertEmoji} />
+          {panel && (
+            <div data-composer-panel className="absolute bottom-full left-2 z-40 mb-2 max-w-[calc(100%-1rem)]">
+              {panel === "emoji" ? (
+                <EmojiPickerPanel onSelect={insertEmoji} />
+              ) : (
+                <GifPicker onSelect={sendGif} autoFocusSearch={pointerFine} />
+              )}
             </div>
           )}
           <form onSubmit={handleSend} className="border-t border-neutral-800">
             <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
-            <div className="px-4 py-3 flex items-center gap-2">
+            <div className="px-3 sm:px-4 py-3 flex items-center gap-1 sm:gap-2">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -1185,7 +1216,7 @@ export default function ChatPage() {
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2.5 transition"
+                className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2 sm:p-2.5 transition"
                 aria-label="Add images"
                 title="Add images (or paste / drop them)"
               >
@@ -1197,19 +1228,35 @@ export default function ChatPage() {
               </button>
               <button
                 type="button"
-                data-emoji-picker
-                onClick={() => setShowEmoji((v) => !v)}
-                className={`rounded-xl p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 ${
-                  showEmoji ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
+                data-composer-panel
+                onClick={() => setPanel((p) => (p === "emoji" ? null : "emoji"))}
+                className={`rounded-xl p-2 sm:p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 ${
+                  panel === "emoji" ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
                 }`}
                 aria-label="Emoji"
-                aria-expanded={showEmoji}
+                aria-expanded={panel === "emoji"}
                 title="Emoji"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <circle cx="12" cy="12" r="9" strokeWidth={2} />
                   <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
                 </svg>
+              </button>
+              <button
+                type="button"
+                data-composer-panel
+                onClick={() => setPanel((p) => (p === "gif" ? null : "gif"))}
+                disabled={connState !== "open"}
+                className={`rounded-xl p-2 sm:p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-50 ${
+                  panel === "gif" ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
+                }`}
+                aria-label="GIF"
+                aria-expanded={panel === "gif"}
+                title="Send a GIF"
+              >
+                <span className="flex h-5 items-center rounded border-[1.5px] border-current px-1 text-[9px] font-bold leading-none tracking-wide">
+                  GIF
+                </span>
               </button>
               <input
                 ref={inputRef}
@@ -1227,7 +1274,7 @@ export default function ChatPage() {
                 disabled={connState !== "open"}
                 maxLength={MAX_MESSAGE_LENGTH}
                 autoFocus
-                className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
+                className="flex-1 min-w-0 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
               />
               <button
                 type="submit"
@@ -1301,7 +1348,11 @@ export default function ChatPage() {
               )}
               <p className="whitespace-pre-wrap">
                 {contextMsg.content ||
-                  (contextMsg.attachments.length > 1 ? `📷 ${contextMsg.attachments.length} photos` : "📷 Photo")}
+                  (contextMsg.gif
+                    ? "GIF"
+                    : contextMsg.attachments.length > 1
+                      ? `📷 ${contextMsg.attachments.length} photos`
+                      : "📷 Photo")}
               </p>
               <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
                 <span className={`text-[10px] ${isOwn ? "text-violet-300" : "text-neutral-500"}`}>

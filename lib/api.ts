@@ -158,6 +158,7 @@ export interface LastMessage {
   sender_pseudo: string;
   content: string;
   attachment_count: number;
+  has_gif: boolean;
   sent_at: string;
 }
 
@@ -189,6 +190,35 @@ export interface Attachment {
   size: number;
 }
 
+/** A GIF from the GIF library, as attached to a message. */
+export interface MessageGif {
+  id: string;
+  url: string;
+  width: number;
+  height: number;
+}
+
+/** A GIF search result: the message rendition plus a smaller one for the picker grid. */
+export interface Gif extends MessageGif {
+  title: string;
+  preview_url: string;
+  preview_width: number;
+  preview_height: number;
+}
+
+export interface GifPage {
+  gifs: Gif[];
+  next_offset: number | null;
+}
+
+export function searchGifs(q: string, offset = 0) {
+  return apiFetch<GifPage>(`/gifs/search?q=${encodeURIComponent(q)}&offset=${offset}`);
+}
+
+export function trendingGifs(offset = 0) {
+  return apiFetch<GifPage>(`/gifs/trending?offset=${offset}`);
+}
+
 export interface Message {
   id: string;
   sender_id: string;
@@ -197,6 +227,7 @@ export interface Message {
   sent_at: string;
   reactions: Reaction[];
   attachments: Attachment[];
+  gif: MessageGif | null;
 }
 
 export interface MessagePage {
@@ -313,7 +344,7 @@ export function removeReaction(messageId: string) {
 }
 
 export type WsOutgoing =
-  | { type: "message"; content: string; client_id: string; attachment_ids?: string[] }
+  | { type: "message"; content: string; client_id: string; attachment_ids?: string[]; gif_id?: string }
   | { type: "typing" }
   | { type: "read"; id: string };
 
@@ -327,6 +358,7 @@ export type WsIncoming =
       content?: string;
       sent_at: string;
       attachments?: Attachment[];
+      gif?: MessageGif;
     }
   | { type: "message_ack"; id: string; client_id: string; sent_at: string }
   | { type: "message_error"; client_id: string }
@@ -348,6 +380,7 @@ export type WsNotification =
       content?: string;
       sent_at: string;
       attachments?: Attachment[];
+      gif?: MessageGif;
     }
   | { type: "invitation"; room_id: string }
   | { type: "room_removed"; room_id: string }

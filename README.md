@@ -10,6 +10,7 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Send images and GIFs: button, paste or drag-and-drop. Photos are resized to 2048px and stripped of EXIF (GPS) in the browser; GIFs stay animated
 - Typing indicators showing who is typing, and "seen by" read receipts
 - Emoji picker (native emojis, with search, recently used and skin tones) in the message box
+- GIF library: search GIPHY and send with one click (requires `GIPHY_API_KEY` on the backend)
 - Emoji reactions: hover or right-click a message on desktop, long-press on mobile, double-click/tap for ❤️, "+" for any emoji
 - Members panel: invite, cancel pending invitations, remove members (owner), leave
 - Rename and delete rooms (owner)

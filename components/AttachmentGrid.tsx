@@ -38,6 +38,7 @@ function Thumb({
       <img
         src={attachmentSrc(attachment)}
         alt=""
+        referrerPolicy="no-referrer"
         loading="lazy"
         decoding="async"
         draggable={false}
