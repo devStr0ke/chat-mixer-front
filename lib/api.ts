@@ -351,6 +351,7 @@ export type WsNotification =
     }
   | { type: "invitation"; room_id: string }
   | { type: "room_removed"; room_id: string }
+  | { type: "room_read"; room_id: string }
   | { type: "online_count"; count: number };
 
 export function createChatWebSocket(roomId: string): WebSocket {

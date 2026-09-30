@@ -116,6 +116,11 @@ export default function RoomsPage() {
               });
               break;
             }
+            case "room_read":
+              setRooms((prev) =>
+                prev.map((r) => (r.id === msg.room_id && r.unread_count > 0 ? { ...r, unread_count: 0 } : r))
+              );
+              break;
             case "invitation":
               fetchInvitations();
               break;

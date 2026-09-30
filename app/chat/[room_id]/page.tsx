@@ -110,6 +110,7 @@ export default function ChatPage() {
   const composer = useAttachmentUploads(room_id, setError);
   const messagesRef = useRef<ChatMessage[]>([]);
   const nearBottomRef = useRef(true);
+  const lastReadSentRef = useRef<string | null>(null);
   const scrollModeRef = useRef<"none" | "bottom" | "restore">("none");
   const restoreRef = useRef({ height: 0, top: 0 });
 
@@ -138,6 +139,27 @@ export default function ChatPage() {
       if (isStatus(err, 404)) markRemoved();
     }
   }, [room_id, markRemoved]);
+
+  // A message only counts as seen when it's really on screen: tab visible,
+  // window focused and the conversation scrolled to the latest messages.
+  // Called on arrival and again whenever one of those conditions may have changed.
+  const markReadIfViewing = useCallback(
+    (messageId?: string) => {
+      if (document.visibilityState !== "visible" || !document.hasFocus() || !nearBottomRef.current) return;
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+
+      let id = messageId;
+      if (!id) {
+        const latest = messagesRef.current.findLast((m) => !m.status);
+        if (!latest || latest.sender_id === userId) return;
+        id = latest.id;
+      }
+      if (id === lastReadSentRef.current) return;
+      lastReadSentRef.current = id;
+      wsRef.current.send(JSON.stringify({ type: "read", id }));
+    },
+    [userId]
+  );
 
   const clearTyping = useCallback((id: string) => {
     clearTimeout(typingTimersRef.current[id]);
@@ -179,22 +201,15 @@ export default function ChatPage() {
       }
     }
 
-    function markLatestRead(ws: WebSocket) {
-      const latest = messagesRef.current.findLast((m) => !m.status);
-      if (latest && latest.sender_id !== userId) {
-        ws.send(JSON.stringify({ type: "read", id: latest.id }));
-      }
-    }
-
     // After a reconnect, pick up whatever was sent while we were away.
-    async function catchUp(ws: WebSocket) {
+    async function catchUp() {
       try {
         const page = await getRoomMessages(room_id);
         if (cancelled) return;
         setMessages((prev) => mergeMessages(prev, page.messages));
         messagesRef.current = mergeMessages(messagesRef.current, page.messages);
         refreshRoom();
-        if (ws.readyState === WebSocket.OPEN) markLatestRead(ws);
+        markReadIfViewing();
       } catch { /* the close handler deals with lost access */ }
     }
 
@@ -210,10 +225,11 @@ export default function ChatPage() {
         const isReconnect = reconnectCountRef.current > 0;
         reconnectCountRef.current = 0;
         setConnState("open");
+        lastReadSentRef.current = null;
         if (isReconnect) {
-          catchUp(ws);
+          catchUp();
         } else {
-          markLatestRead(ws);
+          markReadIfViewing();
         }
       });
 
@@ -240,7 +256,7 @@ export default function ChatPage() {
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
             if (incoming.sender_id !== userId) {
-              wsSend({ type: "read", id: incoming.id });
+              markReadIfViewing(incoming.id);
             }
             break;
           }
@@ -344,11 +360,22 @@ export default function ChatPage() {
         wsRef.current = null;
       }
     };
-  }, [room_id, userId, refreshRoom, markRemoved, clearTyping]);
+  }, [room_id, userId, refreshRoom, markRemoved, clearTyping, markReadIfViewing]);
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  // coming back to the tab/window marks what arrived meanwhile as seen
+  useEffect(() => {
+    const handleActive = () => markReadIfViewing();
+    document.addEventListener("visibilitychange", handleActive);
+    window.addEventListener("focus", handleActive);
+    return () => {
+      document.removeEventListener("visibilitychange", handleActive);
+      window.removeEventListener("focus", handleActive);
+    };
+  }, [markReadIfViewing]);
 
   useEffect(() => {
     if (!picker) return;
@@ -409,6 +436,7 @@ export default function ChatPage() {
     const el = scrollRef.current;
     if (!el) return;
     nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM;
+    if (nearBottomRef.current) markReadIfViewing();
     if (el.scrollTop < LOAD_OLDER_THRESHOLD && hasMore && !loadingOlder) {
       loadOlder();
     }
