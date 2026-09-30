@@ -9,7 +9,8 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Real-time messaging over WebSocket (JSON protocol) with paginated history
 - Send images and GIFs: button, paste or drag-and-drop. Photos are resized to 2048px and stripped of EXIF (GPS) in the browser; GIFs stay animated
 - Typing indicators showing who is typing, and "seen by" read receipts
-- Emoji reactions: hover or right-click a message on desktop, long-press on mobile, double-click/tap for ❤️
+- Emoji picker (native emojis, with search, recently used and skin tones) in the message box
+- Emoji reactions: hover or right-click a message on desktop, long-press on mobile, double-click/tap for ❤️, "+" for any emoji
 - Members panel: invite, cancel pending invitations, remove members (owner), leave
 - Rename and delete rooms (owner)
 - Live unread badges and message previews via a global notification WebSocket

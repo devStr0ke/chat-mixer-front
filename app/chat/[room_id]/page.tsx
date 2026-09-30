@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import dynamic from "next/dynamic";
 import { useParams, useRouter } from "next/navigation";
 import {
   getRoom,
@@ -28,6 +29,12 @@ import { Lightbox } from "@/components/Lightbox";
 import { PendingUploads } from "@/components/PendingUploads";
 import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
 
+// loaded on first use: most visits never open the picker
+const EmojiPickerPanel = dynamic(() => import("@/components/EmojiPickerPanel").then((m) => m.EmojiPickerPanel), {
+  ssr: false,
+  loading: () => <div className="h-[380px] w-[302px] rounded-2xl border border-neutral-700 bg-neutral-900 shadow-2xl" />,
+});
+
 type ConnectionState = "connecting" | "open" | "closed";
 
 /** A message as shown locally: optimistic sends carry a client_id until acked. */
@@ -44,6 +51,7 @@ const TYPING_TIMEOUT = 4000;
 const LOAD_OLDER_THRESHOLD = 80;
 const NEAR_BOTTOM = 120;
 const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+const MAX_MESSAGE_LENGTH = 2000;
 
 function isStatus(err: unknown, status: number): boolean {
   return (err as { status?: number } | null)?.status === status;
@@ -89,6 +97,9 @@ export default function ChatPage() {
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
   const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
+  const [showEmoji, setShowEmoji] = useState(false);
+  // message id the full emoji picker is reacting to
+  const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -105,6 +116,8 @@ export default function ChatPage() {
   // a long-press opens the reaction overlay; swallow the click that follows it
   const holdFiredRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // last caret position in the message box, so emojis land where the user was typing
+  const caretRef = useRef<{ start: number; end: number } | null>(null);
   const dragDepthRef = useRef(0);
 
   const composer = useAttachmentUploads(room_id, setError);
@@ -393,6 +406,24 @@ export default function ChatPage() {
     };
   }, [picker]);
 
+  useEffect(() => {
+    if (!showEmoji && !reactionPickerFor) return;
+    function handleMouseDown(e: MouseEvent) {
+      if (!(e.target as Element).closest("[data-emoji-picker]")) setShowEmoji(false);
+    }
+    function handleKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      setShowEmoji(false);
+      setReactionPickerFor(null);
+    }
+    document.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [showEmoji, reactionPickerFor]);
+
   const typingCount = Object.keys(typingUsers).length;
 
   // Keep the view pinned: jump to the bottom on load/send, follow new messages
@@ -474,6 +505,8 @@ export default function ChatPage() {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     sendContent(text, composer.take());
     setInput("");
+    caretRef.current = null;
+    setShowEmoji(false);
     lastTypingSentRef.current = 0;
     inputRef.current?.focus();
   }
@@ -523,6 +556,29 @@ export default function ChatPage() {
     setLightbox({ items: msg.attachments, index });
   }
 
+  function saveCaret(e: React.SyntheticEvent<HTMLInputElement>) {
+    const el = e.currentTarget;
+    caretRef.current = { start: el.selectionStart ?? el.value.length, end: el.selectionEnd ?? el.value.length };
+  }
+
+  function insertEmoji(emoji: string) {
+    const start = Math.min(caretRef.current?.start ?? input.length, input.length);
+    const end = Math.min(caretRef.current?.end ?? input.length, input.length);
+    const next = input.slice(0, start) + emoji + input.slice(end);
+    if (next.length > MAX_MESSAGE_LENGTH) return;
+    handleInputChange(next);
+
+    const caret = start + emoji.length;
+    caretRef.current = { start: caret, end: caret };
+    // keep typing flow on desktop; on touch devices refocusing would pop the keyboard
+    if (window.matchMedia("(pointer: fine)").matches) {
+      setTimeout(() => {
+        inputRef.current?.focus();
+        inputRef.current?.setSelectionRange(caret, caret);
+      }, 0);
+    }
+  }
+
   function handleInputChange(value: string) {
     setInput(value);
     const now = Date.now();
@@ -564,6 +620,7 @@ export default function ChatPage() {
   async function handleReact(messageId: string, emoji: string) {
     setContextMsg(null);
     setPicker(null);
+    setReactionPickerFor(null);
     if (!userId) return;
     const existing = messages.find((m) => m.id === messageId)?.reactions.find((r) => r.user_id === userId);
     if (existing?.emoji === emoji) {
@@ -1010,6 +1067,10 @@ export default function ChatPage() {
                         <ReactionBar
                           selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
                           onPick={(emoji) => handleReact(msg.id, emoji)}
+                          onMore={() => {
+                            setPicker(null);
+                            setReactionPickerFor(msg.id);
+                          }}
                           compact
                         />
                       </div>
@@ -1100,57 +1161,98 @@ export default function ChatPage() {
           </button>
         </div>
       ) : (
-        <form onSubmit={handleSend} className="border-t border-neutral-800 flex-shrink-0">
-          <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
-          <div className="px-4 py-3 flex items-center gap-2">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept={ACCEPTED_IMAGE_TYPES.join(",")}
-              multiple
-              hidden
-              onChange={(e) => {
-                composer.addFiles(Array.from(e.target.files ?? []));
-                e.target.value = "";
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2.5 transition"
-              aria-label="Add images"
-              title="Add images (or paste / drop them)"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
-                <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={2} />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 15l-5-5L5 20" />
-              </svg>
-            </button>
-            <input
-              ref={inputRef}
-              type="text"
-              value={input}
-              onPaste={handlePaste}
-              onChange={(e) => handleInputChange(e.target.value)}
-              placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
-              disabled={connState !== "open"}
-              maxLength={2000}
-              autoFocus
-              className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
-            />
-            <button
-              type="submit"
-              disabled={connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0)}
-              className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
-              aria-label="Send"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
-            </button>
+        <div className="relative flex-shrink-0">
+          {/* outside the form: a button in there would submit the message */}
+          {showEmoji && (
+            <div data-emoji-picker className="absolute bottom-full left-2 z-40 mb-2 max-w-[calc(100%-1rem)]">
+              <EmojiPickerPanel onSelect={insertEmoji} />
+            </div>
+          )}
+          <form onSubmit={handleSend} className="border-t border-neutral-800">
+            <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
+            <div className="px-4 py-3 flex items-center gap-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES.join(",")}
+                multiple
+                hidden
+                onChange={(e) => {
+                  composer.addFiles(Array.from(e.target.files ?? []));
+                  e.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2.5 transition"
+                aria-label="Add images"
+                title="Add images (or paste / drop them)"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
+                  <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={2} />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 15l-5-5L5 20" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                data-emoji-picker
+                onClick={() => setShowEmoji((v) => !v)}
+                className={`rounded-xl p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 ${
+                  showEmoji ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
+                }`}
+                aria-label="Emoji"
+                aria-expanded={showEmoji}
+                title="Emoji"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                  <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
+                </svg>
+              </button>
+              <input
+                ref={inputRef}
+                type="text"
+                value={input}
+                onPaste={handlePaste}
+                onChange={(e) => {
+                  saveCaret(e);
+                  handleInputChange(e.target.value);
+                }}
+                onSelect={saveCaret}
+                onKeyUp={saveCaret}
+                onClick={saveCaret}
+                placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
+                disabled={connState !== "open"}
+                maxLength={MAX_MESSAGE_LENGTH}
+                autoFocus
+                className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
+              />
+              <button
+                type="submit"
+                disabled={connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0)}
+                className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
+                aria-label="Send"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {reactionPickerFor && (
+        <div
+          className="fixed inset-0 z-[55] flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
+          onClick={() => setReactionPickerFor(null)}
+        >
+          <div onClick={(e) => e.stopPropagation()}>
+            <EmojiPickerPanel autoFocusSearch onSelect={(emoji) => handleReact(reactionPickerFor, emoji)} />
           </div>
-        </form>
+        </div>
       )}
 
       {lightbox && (
@@ -1213,6 +1315,10 @@ export default function ChatPage() {
               <ReactionBar
                 selected={myReaction?.emoji}
                 onPick={(emoji) => handleReact(contextMsg.id, emoji)}
+                onMore={() => {
+                  setContextMsg(null);
+                  setReactionPickerFor(contextMsg.id);
+                }}
               />
             </div>
           </div>
@@ -1225,16 +1331,24 @@ export default function ChatPage() {
 function ReactionBar({
   selected,
   onPick,
+  onMore,
   compact = false,
 }: {
   selected?: string;
   onPick: (emoji: string) => void;
+  onMore: () => void;
   compact?: boolean;
 }) {
+  const button = `leading-none flex items-center justify-center rounded-full transition hover:scale-125 active:scale-110 ${
+    compact ? "text-xl w-9 h-9 hover:bg-neutral-800" : "text-2xl w-9 h-9"
+  }`;
+  // a reaction picked from the full picker isn't one of the shortcuts
+  const custom = selected && !EMOJIS.includes(selected) ? selected : null;
+
   return (
     <div
       className={`flex items-center bg-neutral-900 border border-neutral-700 rounded-full shadow-2xl ${
-        compact ? "gap-0.5 px-1.5 py-1" : "gap-2 px-3 py-2"
+        compact ? "gap-0.5 px-1.5 py-1" : "gap-0.5 px-2 py-2"
       }`}
     >
       {EMOJIS.map((emoji) => (
@@ -1242,13 +1356,31 @@ function ReactionBar({
           key={emoji}
           type="button"
           onClick={() => onPick(emoji)}
-          className={`leading-none flex items-center justify-center rounded-full transition hover:scale-125 active:scale-110 ${
-            compact ? "text-xl w-9 h-9 hover:bg-neutral-800" : "text-2xl w-10 h-10"
-          } ${selected === emoji ? "bg-violet-600/30 ring-2 ring-violet-500 scale-110" : ""}`}
+          className={`${button} ${selected === emoji ? "bg-violet-600/30 ring-2 ring-violet-500 scale-110" : ""}`}
         >
           {emoji}
         </button>
       ))}
+      {custom && (
+        <button
+          type="button"
+          onClick={() => onPick(custom)}
+          className={`${button} bg-violet-600/30 ring-2 ring-violet-500 scale-110`}
+        >
+          {custom}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={onMore}
+        className={`${button} text-neutral-400 hover:text-neutral-200`}
+        aria-label="More emojis"
+        title="More emojis"
+      >
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v14M5 12h14" />
+        </svg>
+      </button>
     </div>
   );
 }
