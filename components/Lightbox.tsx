@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { attachmentSrc, type DisplayAttachment } from "./AttachmentGrid";
+import { isVideo } from "@/lib/media";
+import { attachmentSrc, posterSrc, type DisplayAttachment } from "./AttachmentGrid";
 
-/** Full-screen viewer for a message's images. Arrow keys navigate, Escape closes. */
+/** Full-screen viewer for a message's photos and videos. Arrow keys navigate, Escape closes. */
 export function Lightbox({
   attachments,
   index,
@@ -20,6 +21,8 @@ export function Lightbox({
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       if (e.key === "Escape") onClose();
+      // a focused video uses the arrows to seek
+      if (e.target instanceof HTMLVideoElement) return;
       if (e.key === "ArrowLeft") setCurrent((c) => (c - 1 + count) % count);
       if (e.key === "ArrowRight") setCurrent((c) => (c + 1) % count);
     }
@@ -56,14 +59,27 @@ export function Lightbox({
         </div>
       </div>
 
-      {/* eslint-disable-next-line @next/next/no-img-element -- authenticated, same-origin images */}
-      <img
-        src={attachmentSrc(attachment)}
-        alt=""
-        referrerPolicy="no-referrer"
-        onClick={(e) => e.stopPropagation()}
-        className="max-w-[92vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
-      />
+      {isVideo(attachment) ? (
+        <video
+          key={attachment.id}
+          src={attachmentSrc(attachment)}
+          poster={posterSrc(attachment)}
+          controls
+          autoPlay
+          playsInline
+          onClick={(e) => e.stopPropagation()}
+          className="max-w-[92vw] max-h-[85vh] rounded-lg shadow-2xl bg-black"
+        />
+      ) : (
+        // eslint-disable-next-line @next/next/no-img-element -- authenticated, same-origin images
+        <img
+          src={attachmentSrc(attachment)}
+          alt=""
+          referrerPolicy="no-referrer"
+          onClick={(e) => e.stopPropagation()}
+          className="max-w-[92vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
+        />
+      )}
 
       {count > 1 && (
         <>
@@ -73,7 +89,7 @@ export function Lightbox({
               setCurrent((c) => (c - 1 + count) % count);
             }}
             className={`${navButton} left-3`}
-            aria-label="Previous image"
+            aria-label="Previous"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
@@ -85,7 +101,7 @@ export function Lightbox({
               setCurrent((c) => (c + 1) % count);
             }}
             className={`${navButton} right-3`}
-            aria-label="Next image"
+            aria-label="Next"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />

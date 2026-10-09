@@ -31,7 +31,8 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // /api is excluded so upload bodies stream straight to the rewrite instead
-  // of being buffered by the proxy (which caps request bodies at 10 MB)
+  // /api calls skip this check (the backend authenticates them). The /api
+  // rewrite still caps request bodies at 10 MB, so uploads go to the backend
+  // directly (see uploadAttachment)
   matcher: ["/((?!api/|emojibase/|_next/static|_next/image|favicon.ico).*)"],
 };

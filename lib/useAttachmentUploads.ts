@@ -5,83 +5,127 @@ import {
   ACCEPTED_IMAGE_TYPES,
   MAX_ATTACHMENTS_PER_MESSAGE,
   MAX_ATTACHMENT_BYTES,
+  MAX_VIDEO_BYTES,
   uploadAttachment,
   type Attachment,
 } from "./api";
 import { prepareImage } from "./images";
+import { isVideoFile, prepareVideo } from "./media";
 
 export type PendingUpload = {
   key: string;
+  kind: "image" | "video";
+  /** local blob URL of the picked file */
   previewUrl: string;
+  /** videos: local blob URL of the poster frame, once it's been captured */
+  posterUrl?: string;
   status: "uploading" | "done" | "error";
+  /** fraction of the file sent so far (0–1) */
+  progress?: number;
   attachment?: Attachment;
   error?: string;
 };
 
 /**
- * Composer attachments: each picked image is prepared and uploaded right away,
- * so sending only has to reference the uploaded ids.
+ * Composer attachments: each picked photo or video is prepared and uploaded
+ * right away, so sending only has to reference the uploaded ids.
  */
 export function useAttachmentUploads(roomId: string, onError: (message: string) => void) {
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const uploadsRef = useRef<PendingUpload[]>([]);
   const objectUrlsRef = useRef(new Set<string>());
+  const abortsRef = useRef(new Map<string, AbortController>());
   const keyRef = useRef(0);
 
   useEffect(() => {
     uploadsRef.current = uploads;
   }, [uploads]);
 
-  // previews stay in use by sent messages, so only release them on leave
+  // previews stay in use by sent messages, so only release them on leave;
+  // uploads still in flight are dropped too (a large video can take a while)
   useEffect(() => {
     const urls = objectUrlsRef.current;
-    return () => urls.forEach((url) => URL.revokeObjectURL(url));
+    const aborts = abortsRef.current;
+    return () => {
+      aborts.forEach((controller) => controller.abort());
+      urls.forEach((url) => URL.revokeObjectURL(url));
+    };
   }, []);
 
   const update = useCallback((key: string, patch: Partial<PendingUpload>) => {
     setUploads((prev) => prev.map((u) => (u.key === key ? { ...u, ...patch } : u)));
   }, []);
 
+  const objectUrl = useCallback((blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    objectUrlsRef.current.add(url);
+    return url;
+  }, []);
+
   const addFiles = useCallback(
     (files: File[]) => {
-      const images = files.filter((f) => ACCEPTED_IMAGE_TYPES.includes(f.type));
-      if (images.length < files.length) {
-        onError("Only JPEG, PNG, GIF and WebP images can be sent.");
+      const accepted = files.filter((f) => ACCEPTED_IMAGE_TYPES.includes(f.type) || isVideoFile(f));
+      if (accepted.length < files.length) {
+        onError("Only photos (JPEG, PNG, GIF, WebP) and videos (MP4, MOV, WebM) can be sent.");
       }
       const room = MAX_ATTACHMENTS_PER_MESSAGE - uploadsRef.current.length;
-      if (images.length > room) {
-        onError(`You can send up to ${MAX_ATTACHMENTS_PER_MESSAGE} images at once.`);
+      if (accepted.length > room) {
+        onError(`You can send up to ${MAX_ATTACHMENTS_PER_MESSAGE} photos or videos at once.`);
       }
 
-      for (const file of images.slice(0, Math.max(0, room))) {
+      for (const file of accepted.slice(0, Math.max(0, room))) {
         keyRef.current += 1;
         const key = `upload-${keyRef.current}`;
-        const previewUrl = URL.createObjectURL(file);
-        objectUrlsRef.current.add(previewUrl);
-        const pending: PendingUpload = { key, previewUrl, status: "uploading" };
+        const kind = isVideoFile(file) ? "video" : "image";
+        const pending: PendingUpload = { key, kind, previewUrl: objectUrl(file), status: "uploading" };
         uploadsRef.current = [...uploadsRef.current, pending];
         setUploads((prev) => [...prev, pending]);
 
+        const controller = new AbortController();
+        abortsRef.current.set(key, controller);
+        const onProgress = (progress: number) => update(key, { progress });
+
         (async () => {
           try {
-            const blob = await prepareImage(file);
-            if (blob.size > MAX_ATTACHMENT_BYTES) throw new Error("Image is too large (max 10 MB).");
-            const attachment = await uploadAttachment(roomId, blob, file.name || "image");
+            let attachment: Attachment;
+            if (kind === "video") {
+              if (file.size > MAX_VIDEO_BYTES) throw new Error("Video is too large (max 100 MB).");
+              const { poster, durationMs } = await prepareVideo(file);
+              if (poster) update(key, { posterUrl: objectUrl(poster) });
+              attachment = await uploadAttachment(roomId, file, file.name || "video", {
+                poster,
+                durationMs,
+                onProgress,
+                signal: controller.signal,
+              });
+            } else {
+              const blob = await prepareImage(file);
+              if (blob.size > MAX_ATTACHMENT_BYTES) throw new Error("Image is too large (max 10 MB).");
+              attachment = await uploadAttachment(roomId, blob, file.name || "image", {
+                onProgress,
+                signal: controller.signal,
+              });
+            }
             update(key, { status: "done", attachment });
           } catch (err) {
+            if (controller.signal.aborted) return;
             update(key, { status: "error", error: err instanceof Error ? err.message : "Upload failed." });
+          } finally {
+            abortsRef.current.delete(key);
           }
         })();
       }
     },
-    [roomId, onError, update]
+    [roomId, onError, update, objectUrl]
   );
 
   const remove = useCallback((key: string) => {
+    abortsRef.current.get(key)?.abort();
     const upload = uploadsRef.current.find((u) => u.key === key);
-    if (upload) {
-      URL.revokeObjectURL(upload.previewUrl);
-      objectUrlsRef.current.delete(upload.previewUrl);
+    for (const url of [upload?.previewUrl, upload?.posterUrl]) {
+      if (!url) continue;
+      URL.revokeObjectURL(url);
+      objectUrlsRef.current.delete(url);
     }
     setUploads((prev) => prev.filter((u) => u.key !== key));
   }, []);
@@ -90,7 +134,7 @@ export function useAttachmentUploads(roomId: string, onError: (message: string) 
   const take = useCallback(() => {
     const ready = uploadsRef.current
       .filter((u) => u.status === "done" && u.attachment)
-      .map((u) => ({ ...u.attachment!, preview_url: u.previewUrl }));
+      .map((u) => ({ ...u.attachment!, preview_url: u.previewUrl, poster_preview_url: u.posterUrl }));
     uploadsRef.current = [];
     setUploads([]);
     return ready;

@@ -158,6 +158,8 @@ export interface LastMessage {
   sender_pseudo: string;
   content: string;
   attachment_count: number;
+  /** how many of the attachments are videos */
+  video_count: number;
   has_gif: boolean;
   sent_at: string;
 }
@@ -193,12 +195,17 @@ export interface Reaction {
   emoji: string;
 }
 
+/** An uploaded photo or video. A video's width/height are those of its poster frame. */
 export interface Attachment {
   id: string;
   content_type: string;
   width: number;
   height: number;
   size: number;
+  /** videos: length, when the uploader's browser could read it */
+  duration_ms?: number;
+  /** videos: whether a poster frame was uploaded with it */
+  has_poster?: boolean;
 }
 
 /** A GIF from the GIF library, as attached to a message. */
@@ -269,6 +276,8 @@ export interface ReplyPreview {
   sender_pseudo: string;
   content: string;
   attachment_count: number;
+  /** how many of the attachments are videos */
+  video_count: number;
   has_gif: boolean;
 }
 
@@ -409,21 +418,75 @@ export function linkPreviewImageUrl(imageId: string) {
 }
 
 export const ACCEPTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+/** MP4, iPhone MOV and WebM, played as they are (no re-encoding) */
+export const ACCEPTED_VIDEO_TYPES = ["video/mp4", "video/quicktime", "video/webm"];
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+export const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 
-export function uploadAttachment(roomId: string, file: Blob, filename: string) {
+export type UploadOptions = {
+  /** videos: an early frame, used as the thumbnail */
+  poster?: Blob | null;
+  /** videos: length in milliseconds */
+  durationMs?: number;
+  /** called with the fraction (0–1) of the body sent so far */
+  onProgress?: (fraction: number) => void;
+  signal?: AbortSignal;
+};
+
+/**
+ * Uploads a photo or video. Uses XMLHttpRequest rather than fetch because
+ * fetch can't report upload progress, which matters for videos. It goes
+ * straight to the API (CORS) instead of through the /api rewrite, which caps
+ * request bodies at 10 MB.
+ */
+export function uploadAttachment(
+  roomId: string,
+  file: Blob,
+  filename: string,
+  { poster, durationMs, onProgress, signal }: UploadOptions = {}
+): Promise<Attachment> {
   const form = new FormData();
   form.append("file", file, filename);
-  return apiFetch<Attachment>(`/rooms/${roomId}/attachments`, {
-    method: "POST",
-    body: form,
+  if (poster) form.append("poster", poster, "poster");
+  if (durationMs) form.append("duration_ms", String(Math.round(durationMs)));
+
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Upload cancelled.", "AbortError"));
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE_URL}/rooms/${roomId}/attachments`);
+    xhr.responseType = "json";
+    const token = getToken();
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
+        resolve(xhr.response as Attachment);
+        return;
+      }
+      const message = (xhr.response as { error?: string } | null)?.error;
+      const err = new Error(message ?? `Upload failed (status ${xhr.status}).`) as Error & { status: number };
+      err.status = xhr.status;
+      reject(err);
+    };
+    xhr.onerror = () => reject(new Error("Upload failed: network error."));
+    xhr.onabort = () => reject(new DOMException("Upload cancelled.", "AbortError"));
+    signal?.addEventListener("abort", () => xhr.abort(), { once: true });
+    xhr.send(form);
   });
 }
 
-/** Same-origin URL, so the browser sends the auth cookie with <img> requests. */
+/** Same-origin URL, so the browser sends the auth cookie with <img> and <video> requests. */
 export function attachmentUrl(attachmentId: string) {
   return `${HTTP_BASE}/attachments/${attachmentId}`;
+}
+
+/** A video's poster frame (only when the attachment has_poster). */
+export function attachmentPosterUrl(attachmentId: string) {
+  return `${HTTP_BASE}/attachments/${attachmentId}/poster`;
 }
 
 export function addReaction(messageId: string, emoji: string) {

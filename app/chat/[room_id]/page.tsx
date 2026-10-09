@@ -14,6 +14,7 @@ import {
   removeReaction,
   editMessage,
   ACCEPTED_IMAGE_TYPES,
+  ACCEPTED_VIDEO_TYPES,
   type RoomDetail,
   type Member,
   type Message,
@@ -30,6 +31,7 @@ import { MembersPanel } from "@/components/MembersPanel";
 import { Avatar } from "@/components/Avatar";
 import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentGrid";
 import { Lightbox } from "@/components/Lightbox";
+import { isVideo, isVideoFile, mediaSummary } from "@/lib/media";
 import { PendingUploads } from "@/components/PendingUploads";
 import { RoomAppearancePanel } from "@/components/RoomAppearancePanel";
 import { EditHistoryDialog } from "@/components/EditHistoryDialog";
@@ -80,18 +82,17 @@ function replyPreviewOf(msg: ChatMessage): ReplyPreview {
     sender_pseudo: msg.sender_pseudo,
     content: msg.content.slice(0, 140),
     attachment_count: msg.attachments.length,
+    video_count: msg.attachments.filter(isVideo).length,
     has_gif: !!msg.gif,
   };
 }
 
 /** One-line description of a quoted message. */
 function replySnippet(reply: ReplyPreview): string {
-  if (reply.content) return reply.content;
-  if (reply.has_gif) return "GIF";
-  return reply.attachment_count > 1 ? `📷 ${reply.attachment_count} photos` : "📷 Photo";
+  return reply.content || mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif);
 }
 
-/** What a message shows as images: its GIF, or its uploaded attachments. */
+/** What a message shows as media: its GIF, or its uploaded photos and videos. */
 function mediaOf(msg: ChatMessage): DisplayAttachment[] {
   if (!msg.gif) return msg.attachments;
   const { id, url, width, height } = msg.gif;
@@ -748,12 +749,12 @@ export default function ChatPage() {
     setPanel(null);
   }
 
-  function imageFiles(list: FileList | null | undefined): File[] {
-    return Array.from(list ?? []).filter((f) => f.type.startsWith("image/"));
+  function mediaFiles(list: FileList | null | undefined): File[] {
+    return Array.from(list ?? []).filter((f) => f.type.startsWith("image/") || isVideoFile(f));
   }
 
   function handlePaste(e: React.ClipboardEvent<HTMLInputElement>) {
-    const files = imageFiles(e.clipboardData.files);
+    const files = mediaFiles(e.clipboardData.files);
     if (files.length === 0 || editing) return;
     e.preventDefault();
     composer.addFiles(files);
@@ -1510,7 +1511,7 @@ export default function ChatPage() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept={ACCEPTED_IMAGE_TYPES.join(",")}
+                accept={[...ACCEPTED_IMAGE_TYPES, ...ACCEPTED_VIDEO_TYPES].join(",")}
                 multiple
                 hidden
                 onChange={(e) => {
@@ -1523,8 +1524,8 @@ export default function ChatPage() {
                 onClick={() => fileInputRef.current?.click()}
                 disabled={!!editing}
                 className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2 sm:p-2.5 transition disabled:opacity-40 disabled:pointer-events-none"
-                aria-label="Add images"
-                title="Add images (or paste / drop them)"
+                aria-label="Add photos or videos"
+                title="Add photos or videos (or paste / drop them)"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
@@ -1636,7 +1637,7 @@ export default function ChatPage() {
 
       {dragging && (
         <div className="pointer-events-none absolute inset-0 z-40 m-3 flex items-center justify-center rounded-2xl border-2 border-dashed border-violet-500 bg-neutral-950/80">
-          <p className="text-sm font-medium text-violet-300">Drop images to send</p>
+          <p className="text-sm font-medium text-violet-300">Drop photos or videos to send</p>
         </div>
       )}
 
@@ -1681,11 +1682,11 @@ export default function ChatPage() {
               {!isOwn && <p className="text-[11px] font-semibold mb-0.5 opacity-80">{contextMsg.sender_pseudo}</p>}
               <p className="whitespace-pre-wrap">
                 {contextMsg.content ||
-                  (contextMsg.gif
-                    ? "GIF"
-                    : contextMsg.attachments.length > 1
-                      ? `📷 ${contextMsg.attachments.length} photos`
-                      : "📷 Photo")}
+                  mediaSummary(
+                    contextMsg.attachments.length,
+                    contextMsg.attachments.filter(isVideo).length,
+                    !!contextMsg.gif
+                  )}
               </p>
               <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
                 <span className="text-[10px] opacity-70">{formatTime(contextMsg.sent_at)}</span>

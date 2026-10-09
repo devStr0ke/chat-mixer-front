@@ -18,6 +18,7 @@ import Link from "next/link";
 import { Avatar } from "@/components/Avatar";
 import { UserFlags } from "@/components/UserFlags";
 import { CreateRoomDialog } from "@/components/CreateRoomDialog";
+import { isVideo, mediaSummary } from "@/lib/media";
 
 export default function RoomsPage() {
   const router = useRouter();
@@ -109,6 +110,7 @@ export default function RoomsPage() {
                     sender_pseudo: msg.sender_pseudo,
                     content: msg.content ?? "",
                     attachment_count: msg.attachments?.length ?? 0,
+                    video_count: msg.attachments?.filter(isVideo).length ?? 0,
                     has_gif: !!msg.gif,
                     sent_at: msg.sent_at,
                   },
@@ -202,9 +204,7 @@ export default function RoomsPage() {
         : `No messages yet · ${room.member_count} members`;
     }
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
-    const photos =
-      last.attachment_count > 1 ? `📷 ${last.attachment_count} photos` : last.attachment_count === 1 ? "📷 Photo" : "";
-    return `${who}: ${last.content || (last.has_gif ? "GIF" : photos)}`;
+    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif)}`;
   }
 
   return (

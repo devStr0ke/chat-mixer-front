@@ -7,7 +7,8 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Create rooms and invite people with a pseudo search
 - Accept or decline invitations, delivered live
 - Real-time messaging over WebSocket (JSON protocol) with paginated history
-- Send images and GIFs: button, paste or drag-and-drop. Photos are resized to 2048px and stripped of EXIF (GPS) in the browser; GIFs stay animated
+- Send photos, videos and GIFs: button, paste or drag-and-drop. Photos are resized to 2048px and stripped of EXIF (GPS) in the browser; GIFs stay animated
+- Videos (MP4, MOV, WebM, up to 100 MB) upload with a progress indicator and can be cancelled; the browser grabs a poster frame and the duration, and they play in a full-screen player
 - Typing indicators showing who is typing, and "seen by" read receipts
 - Emoji picker (native emojis, with search, recently used and skin tones) in the message box
 - GIF library: search GIPHY and send with one click (requires `GIPHY_API_KEY` on the backend)
@@ -36,7 +37,10 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 Create a `.env.local` file at the root of the project:
 
 ```bash
-# Base URL of the Chat Mixer backend (used for HTTP API calls and WS host fallback)
+# Base URL of the Chat Mixer backend. API calls go through the app's /api rewrite
+# to it; photo/video uploads go to it directly (Next.js caps proxied bodies at
+# 10 MB), so this app's origin must be in the backend's CORS_ORIGINS.
+# Also the WebSocket host fallback.
 NEXT_PUBLIC_API_URL=http://localhost:8090
 
 # Optional — only needed for LAN testing between two devices on the same network.
