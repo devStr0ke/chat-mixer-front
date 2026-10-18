@@ -32,6 +32,39 @@ export function formatShort(iso: string): string {
   return d.toLocaleDateString([], { day: "numeric", month: "short" });
 }
 
+/**
+ * Timestamp shown between messages after a pause, as Instagram does: the time
+ * today, then "Yesterday 14:05", "Mon 14:05", "12 Oct, 14:05".
+ */
+export function formatStamp(iso: string): string {
+  const d = new Date(iso);
+  const diff = Math.round((startOfDay(new Date()) - startOfDay(d)) / DAY_MS);
+  const time = formatTime(iso);
+  if (diff === 0) return time;
+  if (diff === 1) return `Yesterday ${time}`;
+  if (diff < 7) return `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
+  const date = d.toLocaleDateString([], {
+    day: "numeric",
+    month: "short",
+    year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+  });
+  return `${date}, ${time}`;
+}
+
+/** "Today at 14:05", "Monday 12 October at 14:05" */
+export function formatFull(iso: string): string {
+  return `${formatDay(iso)} at ${formatTime(iso)}`;
+}
+
+const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Regional_Indicator}|[#*0-9]\uFE0F?\u20E3|\u200D|\uFE0F|\s)+$/u;
+
+/** True for messages of just one to three emojis, shown large without a bubble. */
+export function isBigEmoji(text: string): boolean {
+  if (!text || text.length > 48 || !EMOJI_ONLY.test(text)) return false;
+  const graphemes = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text.replace(/\s/g, ""))];
+  return graphemes.length >= 1 && graphemes.length <= 3;
+}
+
 export function sameDay(a: string, b: string): boolean {
   return startOfDay(new Date(a)) === startOfDay(new Date(b));
 }

@@ -26,7 +26,7 @@ import {
   type WsIncoming,
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
-import { formatTime, formatDay, sameDay, nameColor } from "@/lib/format";
+import { formatTime, formatStamp, formatFull, isBigEmoji, sameDay, nameColor } from "@/lib/format";
 import { MembersPanel } from "@/components/MembersPanel";
 import { Avatar } from "@/components/Avatar";
 import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentGrid";
@@ -39,6 +39,10 @@ import { MessageText } from "@/components/MessageText";
 import { LinkPreviewCard } from "@/components/LinkPreviewCard";
 import { firstLink } from "@/lib/links";
 import { useAttachmentUploads } from "@/lib/useAttachmentUploads";
+import { useMessageGestures } from "@/lib/useMessageGestures";
+import { ReactionBar } from "@/components/ReactionBar";
+import { MessageMenu, type MessageAction } from "@/components/MessageMenu";
+import { ReactionsSheet } from "@/components/ReactionsSheet";
 import { resolveTheme } from "@/lib/theme";
 
 // loaded on first use: most visits never open the picker
@@ -67,7 +71,8 @@ const TYPING_THROTTLE = 3000;
 const TYPING_TIMEOUT = 4000;
 const LOAD_OLDER_THRESHOLD = 80;
 const NEAR_BOTTOM = 120;
-const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+// a pause this long between messages gets a timestamp, as on Instagram
+const STAMP_GAP = 30 * 60 * 1000;
 const MAX_MESSAGE_LENGTH = 2000;
 
 function isStatus(err: unknown, status: number): boolean {
@@ -97,6 +102,20 @@ function mediaOf(msg: ChatMessage): DisplayAttachment[] {
   if (!msg.gif) return msg.attachments;
   const { id, url, width, height } = msg.gif;
   return [{ id: `gif-${id}`, content_type: "image/gif", width, height, size: 0, preview_url: url }];
+}
+
+/**
+ * Instagram-style corners: in a run of messages from one sender, the corners
+ * on the sender's side are tighter where the bubbles meet.
+ */
+function bubbleCorners(isOwn: boolean, joinsPrev: boolean, joinsNext: boolean): string {
+  const [top, bottom] = isOwn ? ["rounded-tr-[6px]", "rounded-br-[6px]"] : ["rounded-tl-[6px]", "rounded-bl-[6px]"];
+  return `rounded-[20px] ${joinsPrev ? top : ""} ${joinsNext ? bottom : ""}`;
+}
+
+/** Whether two consecutive messages are far enough apart for a timestamp between them. */
+function pauseBetween(a: ChatMessage, b: ChatMessage): boolean {
+  return !sameDay(a.sent_at, b.sent_at) || new Date(b.sent_at).getTime() - new Date(a.sent_at).getTime() > STAMP_GAP;
 }
 
 /** Merges fetched messages into the local list by id, keeping chronological order. */
@@ -135,7 +154,13 @@ export default function ChatPage() {
   const [showRename, setShowRename] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
   const [roomVersion, setRoomVersion] = useState(0);
-  const [contextMsg, setContextMsg] = useState<ChatMessage | null>(null);
+  // long-press menu: the message and its bubble on screen
+  const [menu, setMenu] = useState<{ msg: ChatMessage; bubble: HTMLElement } | null>(null);
+  // message whose reactions sheet is open
+  const [reactionsFor, setReactionsFor] = useState<string | null>(null);
+  // double-tap ❤️ animation
+  const [burst, setBurst] = useState<{ id: string; key: number } | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
   const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
@@ -161,11 +186,9 @@ export default function ChatPage() {
   const lastTypingSentRef = useRef(0);
   const typingTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const removedRef = useRef(false);
-  const lastTapRef = useRef<{ id: string; time: number } | null>(null);
-  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pointerTypeRef = useRef<string>("mouse");
-  // a long-press opens the reaction overlay; swallow the click that follows it
-  const holdFiredRef = useRef(false);
+  // the part of the list that slides left to show times
+  const revealRef = useRef<HTMLDivElement>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // last caret position in the message box, so emojis land where the user was typing
   const caretRef = useRef<{ start: number; end: number } | null>(null);
@@ -184,6 +207,26 @@ export default function ChatPage() {
   const lastReadSentRef = useRef<string | null>(null);
   const scrollModeRef = useRef<"none" | "bottom" | "restore">("none");
   const restoreRef = useRef({ height: 0, top: 0 });
+
+  const closeMenu = useCallback(() => setMenu(null), []);
+  const closeReactions = useCallback(() => setReactionsFor(null), []);
+  const gestures = useMessageGestures(revealRef, {
+    onLongPress: (id, bubble) => {
+      const msg = messagesRef.current.find((m) => m.id === id);
+      if (!msg) return;
+      setPicker(null);
+      setMenu({ msg, bubble });
+    },
+    onDoubleTap: (id) => {
+      const msg = messagesRef.current.find((m) => m.id === id);
+      if (msg) likeMessage(msg);
+    },
+    onSwipeReply: (id) => {
+      const msg = messagesRef.current.find((m) => m.id === id);
+      if (msg) startReply(msg);
+    },
+    onRightClick: (id, bubble) => togglePicker(id, bubble),
+  });
 
   function wsSend(payload: WsOutgoing) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -646,7 +689,7 @@ export default function ChatPage() {
   }
 
   function startReply(msg: ChatMessage) {
-    setContextMsg(null);
+    setMenu(null);
     setPicker(null);
     if (editing) stopEditing();
     setReplyTo(msg);
@@ -654,7 +697,7 @@ export default function ChatPage() {
   }
 
   function startEdit(msg: ChatMessage) {
-    setContextMsg(null);
+    setMenu(null);
     setPicker(null);
     setPanel(null);
     setReplyTo(null);
@@ -699,19 +742,11 @@ export default function ChatPage() {
   }
 
   function openHistory(msg: ChatMessage) {
-    if (holdFiredRef.current) {
-      holdFiredRef.current = false;
-      return;
-    }
-    setContextMsg(null);
+    setMenu(null);
     setHistoryFor(msg.id);
   }
 
   async function jumpToMessage(id: string) {
-    if (holdFiredRef.current) {
-      holdFiredRef.current = false;
-      return;
-    }
     if (scrollToMessage(id)) {
       flashMessage(id);
       return;
@@ -781,10 +816,6 @@ export default function ChatPage() {
   }
 
   function openLightbox(msg: ChatMessage, index: number) {
-    if (holdFiredRef.current) {
-      holdFiredRef.current = false;
-      return;
-    }
     setLightbox({ items: mediaOf(msg), index });
   }
 
@@ -830,13 +861,6 @@ export default function ChatPage() {
     );
   }
 
-  function cancelHold() {
-    if (holdTimerRef.current) {
-      clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = null;
-    }
-  }
-
   function togglePicker(messageId: string, anchor: Element) {
     if (picker?.id === messageId) {
       setPicker(null);
@@ -850,7 +874,7 @@ export default function ChatPage() {
   }
 
   async function handleReact(messageId: string, emoji: string) {
-    setContextMsg(null);
+    setMenu(null);
     setPicker(null);
     setReactionPickerFor(null);
     if (!userId) return;
@@ -862,6 +886,37 @@ export default function ChatPage() {
     }
     applyReactionOptimistically(messageId, { user_id: userId, emoji });
     try { await addReaction(messageId, emoji); } catch { applyReactionOptimistically(messageId, existing ?? null); }
+  }
+
+  /** Double-tap: always a ❤️ (never takes it away), with a heart animation. */
+  function likeMessage(msg: ChatMessage) {
+    setBurst({ id: msg.id, key: Date.now() });
+    if (msg.reactions.find((r) => r.user_id === userId)?.emoji !== "❤️") handleReact(msg.id, "❤️");
+  }
+
+  function showToast(text: string) {
+    setToast(text);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 1600);
+  }
+
+  async function copyText(text: string) {
+    setMenu(null);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // no clipboard API (older browsers): copy through a hidden field
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    showToast("Copied");
   }
 
   async function handleRename(e: React.FormEvent<HTMLFormElement>) {
@@ -959,6 +1014,11 @@ export default function ChatPage() {
   }
 
   const lastOwnSent = messages.findLast((m) => m.sender_id === user.id && !m.status);
+  // the composer shows "Send" once there's something to send
+  const hasDraft = !!editing || input.trim() !== "" || composer.uploads.length > 0;
+  const sendDisabled = editing
+    ? savingEdit || (!input.trim() && mediaOf(editing).length === 0)
+    : connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0);
   const lastOwnSeenBy = lastOwnSent ? seenBy(lastOwnSent) : [];
 
   return (
@@ -1130,7 +1190,8 @@ export default function ChatPage() {
         ref={scrollRef}
         onScroll={handleScroll}
         onClick={() => setShowMenu(false)}
-        className="flex-1 overflow-y-auto px-4 py-4"
+        {...gestures}
+        className="flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 py-4 [touch-action:pan-y_pinch-zoom] pointer-coarse:select-none pointer-coarse:[-webkit-touch-callout:none]"
         style={{ scrollBehavior: "auto", ...look.container }}
       >
         {hasMore && (
@@ -1168,281 +1229,267 @@ export default function ChatPage() {
           </div>
         )}
 
-        {messages.map((msg, i) => {
-          const prev = messages[i - 1];
-          const isOwn = msg.sender_id === user.id;
-          const newDay = !prev || !sameDay(prev.sent_at, msg.sent_at);
-          const showSender = !isOwn && (newDay || prev.sender_id !== msg.sender_id);
-          const confirmed = !msg.status;
-          const seen = isOwn && confirmed ? seenBy(msg) : [];
-          const seenByAll = otherMembers.length > 0 && seen.length === otherMembers.length;
-          const reactionGroups = groupReactions(msg.reactions, user.id);
-          const media = mediaOf(msg);
-          const hasAttachments = media.length > 0;
-          // one card per message, and not on top of images or a GIF
-          const previewUrl = hasAttachments ? null : firstLink(msg.content);
+        <div ref={revealRef}>
+          {messages.map((msg, i) => {
+            const prev = messages[i - 1];
+            const next = messages[i + 1];
+            const isOwn = msg.sender_id === user.id;
+            const confirmed = !msg.status;
+            const stamp = !prev || pauseBetween(prev, msg);
+            const joinsPrev = !stamp && prev.sender_id === msg.sender_id;
+            const joinsNext = !!next && next.sender_id === msg.sender_id && !pauseBetween(msg, next);
+            // names only matter when there's more than one other person
+            const showSender = !isOwn && !joinsPrev && otherMembers.length > 1;
+            const showAvatar = !isOwn && !joinsNext;
+            const reactionGroups = groupReactions(msg.reactions, user.id);
+            const media = mediaOf(msg);
+            const hasAttachments = media.length > 0;
+            const bigEmoji = !hasAttachments && !msg.reply_to && isBigEmoji(msg.content);
+            // photos, videos, GIFs and emoji-only messages go without a bubble
+            const bare = bigEmoji || (hasAttachments && !msg.content && !msg.reply_to);
+            // one card per message, and not on top of images or a GIF
+            const previewUrl = hasAttachments ? null : firstLink(msg.content);
+            const replyCue = (
+              <span
+                data-reply-cue
+                className={`pointer-events-none absolute top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-white opacity-0 ${
+                  isOwn ? "right-full mr-3" : "left-0"
+                }`}
+              >
+                <ReplyIcon className="w-4 h-4" />
+              </span>
+            );
 
-          return (
-            <div key={msg.client_id ?? msg.id} data-message-id={msg.id}>
-              {newDay && (
-                <div className="flex items-center gap-3 my-4" style={{ color: look.muted }}>
-                  <span className="flex-1 h-px bg-current opacity-25" />
-                  <span className="text-[11px] font-medium">{formatDay(msg.sent_at)}</span>
-                  <span className="flex-1 h-px bg-current opacity-25" />
-                </div>
-              )}
-
-              <div className={`group flex ${isOwn ? "justify-end" : "justify-start"} ${showSender || newDay ? "mt-3" : "mt-1"}`}>
-                {!isOwn && (
-                  <div className="w-7 mr-2 flex-shrink-0">
-                    {showSender && <Avatar user={senderOf(msg)} size={28} />}
-                  </div>
+            return (
+              <div key={msg.client_id ?? msg.id} data-message-id={msg.id}>
+                {stamp && (
+                  <p className="my-4 text-center text-[11px] font-medium" style={{ color: look.muted }}>
+                    {formatStamp(msg.sent_at)}
+                  </p>
                 )}
-                <div className={`relative min-w-0 max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
-                  {showSender && (
-                    <span className={`text-[11px] font-medium mb-0.5 ml-1 ${nameColor(msg.sender_id, look.onLight)}`}>
-                      {msg.sender_pseudo}
-                    </span>
-                  )}
-                  <div className="relative">
-                    <div
-                      style={isOwn ? look.ownBubble : look.otherBubble}
-                      className={`rounded-2xl text-sm wrap-anywhere select-none touch-manipulation transition-shadow duration-300 ${
-                        hasAttachments ? "p-1" : "px-4 py-2"
-                      } ${isOwn ? "rounded-br-md" : "rounded-bl-md"} ${msg.status === "failed" ? "opacity-60" : ""} ${
-                        highlightId === msg.id ? "ring-2 ring-amber-300" : ""
-                      }`}
-                      onPointerDown={(e) => {
-                        e.stopPropagation();
-                        pointerTypeRef.current = e.pointerType;
-                        if (!confirmed) return;
-                        holdFiredRef.current = false;
-                        holdTimerRef.current = setTimeout(() => {
-                          holdTimerRef.current = null;
-                          holdFiredRef.current = true;
-                          lastTapRef.current = null;
-                          setContextMsg(msg);
-                        }, 400);
-                      }}
-                      onPointerUp={(e) => {
-                        e.stopPropagation();
-                        if (!confirmed) return;
-                        if (holdTimerRef.current) {
-                          clearTimeout(holdTimerRef.current);
-                          holdTimerRef.current = null;
-                          const now = Date.now();
-                          const last = lastTapRef.current;
-                          if (last?.id === msg.id && now - last.time < 300) {
-                            lastTapRef.current = null;
-                            handleReact(msg.id, "❤️");
-                          } else {
-                            lastTapRef.current = { id: msg.id, time: now };
-                          }
-                        }
-                      }}
-                      onPointerLeave={cancelHold}
-                      onPointerCancel={cancelHold}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        // touch long-press is handled by the hold timer overlay
-                        if (!confirmed || pointerTypeRef.current === "touch") return;
-                        togglePicker(msg.id, e.currentTarget);
-                      }}
-                    >
-                      {msg.reply_to && (
-                        <button
-                          type="button"
-                          onClick={() => jumpToMessage(msg.reply_to!.id)}
-                          title="Go to the original message"
-                          className={`block w-full rounded-lg border-l-2 border-current bg-black/15 px-2.5 py-1.5 text-left ${
-                            hasAttachments ? "mb-1" : "mb-1.5"
-                          }`}
+
+                <div className={`relative ${joinsPrev ? "mt-0.5" : stamp ? "" : "mt-2.5"}`}>
+                  {/* slides in when the list is swiped left */}
+                  <span
+                    className="absolute top-1/2 -right-[68px] w-12 -translate-y-1/2 text-[10px] tabular-nums"
+                    style={{ color: look.muted }}
+                  >
+                    {formatTime(msg.sent_at)}
+                  </span>
+                  {/* fades in while the message is swiped right */}
+                  {!isOwn && replyCue}
+
+                  <div data-shift className={`group flex items-end ${isOwn ? "justify-end" : "justify-start"}`}>
+                    {!isOwn && (
+                      <div className="w-7 mr-2 flex-shrink-0">
+                        {showAvatar && <Avatar user={senderOf(msg)} size={28} />}
+                      </div>
+                    )}
+                    <div className={`relative min-w-0 max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
+                      {showSender && (
+                        <span className={`text-[11px] font-medium mb-0.5 mx-3 ${nameColor(msg.sender_id, look.onLight)}`}>
+                          {msg.sender_pseudo}
+                        </span>
+                      )}
+                      <div className="relative">
+                        {isOwn && replyCue}
+                        <div
+                          data-bubble={confirmed ? "" : undefined}
+                          style={bare ? undefined : isOwn ? look.ownBubble : look.otherBubble}
+                          className={`text-[15px] sm:text-sm leading-snug wrap-anywhere select-none transition-shadow duration-300 ${bubbleCorners(
+                            isOwn,
+                            joinsPrev,
+                            joinsNext
+                          )} ${bare ? (bigEmoji ? "" : "overflow-hidden") : hasAttachments ? "p-1" : "px-3.5 py-2"} ${
+                            msg.status === "pending" ? "opacity-70" : ""
+                          } ${msg.status === "failed" ? "opacity-60" : ""} ${highlightId === msg.id ? "ring-2 ring-amber-300" : ""}`}
                         >
-                          <span className="block truncate text-[11px] font-semibold opacity-90">
-                            {msg.reply_to.sender_id === user.id ? "You" : msg.reply_to.sender_pseudo}
-                          </span>
-                          <span className="break-words text-xs opacity-75 line-clamp-2">
-                            {replySnippet(msg.reply_to)}
-                          </span>
-                        </button>
-                      )}
-                      {hasAttachments && (
-                        <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />
-                      )}
-                      {msg.content && <MessageText text={msg.content} className={hasAttachments ? "px-3 pt-1.5" : ""} />}
-                      {previewUrl && <LinkPreviewCard url={previewUrl} onShown={repinToBottom} />}
-                      <div
-                        className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""} ${
-                          hasAttachments ? "px-3 pb-1" : ""
-                        }`}
-                      >
-                        {msg.edited_at && (
-                          <button
-                            type="button"
-                            onClick={() => openHistory(msg)}
-                            title="See edit history"
-                            className="text-[10px] opacity-70 underline decoration-dotted underline-offset-2 hover:opacity-100"
+                          {msg.reply_to && (
+                            <button
+                              type="button"
+                              onClick={() => jumpToMessage(msg.reply_to!.id)}
+                              title="Go to the original message"
+                              className={`block w-full rounded-xl border-l-2 border-current bg-black/15 px-2.5 py-1.5 text-left ${
+                                hasAttachments ? "mb-1" : "mb-1.5"
+                              }`}
+                            >
+                              <span className="block truncate text-[11px] font-semibold opacity-90">
+                                {msg.reply_to.sender_id === user.id ? "You" : msg.reply_to.sender_pseudo}
+                              </span>
+                              <span className="break-words text-xs opacity-75 line-clamp-2">{replySnippet(msg.reply_to)}</span>
+                            </button>
+                          )}
+                          {hasAttachments && <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />}
+                          {bigEmoji ? (
+                            <p className="text-[44px] leading-tight">{msg.content}</p>
+                          ) : (
+                            msg.content && (
+                              <MessageText text={msg.content} className={hasAttachments ? "px-2.5 pt-1.5 pb-1" : ""} />
+                            )
+                          )}
+                          {previewUrl && <LinkPreviewCard url={previewUrl} onShown={repinToBottom} />}
+                        </div>
+
+                        {burst?.id === msg.id && (
+                          <span
+                            key={burst.key}
+                            className="pointer-events-none absolute inset-0 flex items-center justify-center text-5xl drop-shadow-lg [animation:heart-burst_850ms_both]"
+                            onAnimationEnd={() => setBurst(null)}
                           >
-                            edited
-                          </button>
+                            ❤️
+                          </span>
                         )}
-                        <span className="text-[10px] opacity-70">{formatTime(msg.sent_at)}</span>
-                        {isOwn && confirmed && (
-                          <svg
-                            className={`w-3.5 h-3.5 ${seenByAll ? "opacity-90" : "opacity-45"}`}
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
+
+                        {confirmed && (
+                          <div
+                            className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 items-center gap-0.5 transition focus-within:opacity-100 ${
+                              isOwn ? "right-full mr-1.5 flex-row-reverse" : "left-full ml-1.5"
+                            } ${picker?.id === msg.id ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
                           >
-                            {seenByAll ? (
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M1 12l5 5L17 6M7 12l5 5L23 6" />
-                            ) : (
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
+                            <button
+                              type="button"
+                              data-reaction-picker
+                              onClick={(e) => togglePicker(msg.id, e.currentTarget)}
+                              title="Add reaction (or double-click the message for ❤️)"
+                              aria-label="Add reaction"
+                              className={`w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition ${
+                                picker?.id === msg.id ? "text-neutral-200 bg-neutral-800" : ""
+                              }`}
+                            >
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                                <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => startReply(msg)}
+                              title="Reply"
+                              aria-label="Reply"
+                              className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                            >
+                              <ReplyIcon className="w-4 h-4" />
+                            </button>
+                            {isOwn && (
+                              <button
+                                type="button"
+                                onClick={() => startEdit(msg)}
+                                title="Edit"
+                                aria-label="Edit"
+                                className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                              >
+                                <EditIcon className="w-4 h-4" />
+                              </button>
                             )}
-                          </svg>
+                            <span className="whitespace-nowrap px-1 text-[11px] tabular-nums" style={{ color: look.muted }}>
+                              {formatTime(msg.sent_at)}
+                            </span>
+                          </div>
                         )}
-                        {msg.status === "pending" && (
-                          <svg className="w-3 h-3 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                            <path strokeLinecap="round" strokeWidth={2} d="M12 7v5l3 2" />
-                          </svg>
-                        )}
-                      </div>
-                    </div>
 
-                    {confirmed && (
-                      <div
-                        className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 items-center gap-0.5 transition focus-within:opacity-100 ${
-                          isOwn ? "right-full mr-1.5 flex-row-reverse" : "left-full ml-1.5"
-                        } ${picker?.id === msg.id ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
-                      >
-                        <button
-                          type="button"
-                          data-reaction-picker
-                          onClick={(e) => togglePicker(msg.id, e.currentTarget)}
-                          title="Add reaction (or double-click the message for ❤️)"
-                          aria-label="Add reaction"
-                          className={`w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition ${
-                            picker?.id === msg.id ? "text-neutral-200 bg-neutral-800" : ""
-                          }`}
-                        >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                            <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
-                          </svg>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => startReply(msg)}
-                          title="Reply"
-                          aria-label="Reply"
-                          className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
-                        >
-                          <ReplyIcon className="w-4 h-4" />
-                        </button>
-                        {isOwn && (
-                          <button
-                            type="button"
-                            onClick={() => startEdit(msg)}
-                            title="Edit"
-                            aria-label="Edit"
-                            className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                        {picker?.id === msg.id && (
+                          <div
+                            data-reaction-picker
+                            className={`absolute z-30 ${picker.below ? "top-full mt-1.5" : "bottom-full mb-1.5"} ${
+                              isOwn ? "right-0" : "left-0"
+                            }`}
                           >
-                            <EditIcon className="w-4 h-4" />
-                          </button>
+                            <ReactionBar
+                              selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
+                              onPick={(emoji) => handleReact(msg.id, emoji)}
+                              onMore={() => {
+                                setPicker(null);
+                                setReactionPickerFor(msg.id);
+                              }}
+                              compact
+                            />
+                          </div>
                         )}
                       </div>
-                    )}
 
-                    {picker?.id === msg.id && (
-                      <div
-                        data-reaction-picker
-                        className={`absolute z-30 ${picker.below ? "top-full mt-1.5" : "bottom-full mb-1.5"} ${
-                          isOwn ? "right-0" : "left-0"
-                        }`}
-                      >
-                        <ReactionBar
-                          selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
-                          onPick={(emoji) => handleReact(msg.id, emoji)}
-                          onMore={() => {
-                            setPicker(null);
-                            setReactionPickerFor(msg.id);
-                          }}
-                          compact
-                        />
-                      </div>
-                    )}
-                  </div>
-
-                  {msg.status === "failed" && (
-                    <button
-                      onClick={() => handleRetry(msg)}
-                      className="mt-1 text-[11px] text-red-400 hover:text-red-300 transition"
-                    >
-                      Not sent · tap to retry
-                    </button>
-                  )}
-
-                  {reactionGroups.length > 0 && (
-                    <div className="flex gap-1 mt-1 flex-wrap">
-                      {reactionGroups.map((g) => (
+                      {reactionGroups.length > 0 && (
                         <button
-                          key={g.emoji}
-                          onClick={() => handleReact(msg.id, g.emoji)}
-                          title={g.userIds.map((id) => (id === user.id ? "You" : memberById.get(id)?.pseudo ?? "Former member")).join(", ")}
-                          className={`flex items-center gap-1 text-sm leading-none rounded-full px-2 py-0.5 border transition ${
-                            g.mine
-                              ? "bg-violet-600/20 border-violet-500/40 hover:bg-red-900/30 hover:border-red-500/40"
-                              : "bg-neutral-800 border-neutral-700 hover:border-neutral-500"
+                          type="button"
+                          onClick={() => setReactionsFor(msg.id)}
+                          title={reactionGroups
+                            .map((g) => `${g.emoji} ${g.userIds.map((id) => (id === user.id ? "You" : memberById.get(id)?.pseudo ?? "Former member")).join(", ")}`)
+                            .join("   ")}
+                          aria-label={`${msg.reactions.length} reaction${msg.reactions.length > 1 ? "s" : ""}, see who reacted`}
+                          className={`relative z-10 -mt-2 flex h-[22px] items-center gap-0.5 rounded-full border-2 border-neutral-950 bg-neutral-800 px-1.5 text-[13px] leading-none shadow-sm transition active:scale-95 ${
+                            isOwn ? "mr-2" : "ml-2"
                           }`}
                         >
-                          {g.emoji}
-                          {g.userIds.length > 1 && (
-                            <span className="text-[11px] text-neutral-300 tabular-nums">{g.userIds.length}</span>
+                          {reactionGroups.slice(0, 3).map((g) => (
+                            <span key={g.emoji}>{g.emoji}</span>
+                          ))}
+                          {msg.reactions.length > 1 && (
+                            <span className="ml-0.5 text-[11px] text-neutral-300 tabular-nums">{msg.reactions.length}</span>
                           )}
                         </button>
-                      ))}
-                    </div>
-                  )}
+                      )}
 
-                  {msg === lastOwnSent && lastOwnSeenBy.length > 0 && (
-                    <span className="mt-1 text-[10px]" style={{ color: look.muted }}>
-                      {seenByAll && otherMembers.length > 1
-                        ? "Seen by everyone"
-                        : `Seen by ${lastOwnSeenBy.map((m) => m.pseudo).join(", ")}`}
-                    </span>
-                  )}
+                      {msg.edited_at && (
+                        <button
+                          type="button"
+                          onClick={() => openHistory(msg)}
+                          title="See edit history"
+                          className="mx-3 mt-0.5 text-[11px] hover:underline"
+                          style={{ color: look.muted }}
+                        >
+                          Edited
+                        </button>
+                      )}
+
+                      {msg.status === "failed" && (
+                        <button
+                          onClick={() => handleRetry(msg)}
+                          className="mx-3 mt-1 text-[11px] text-red-400 hover:text-red-300 transition"
+                        >
+                          Not sent · tap to retry
+                        </button>
+                      )}
+
+                      {msg === lastOwnSent && lastOwnSeenBy.length > 0 && (
+                        <span className="mx-3 mt-1 text-[11px]" style={{ color: look.muted }}>
+                          {otherMembers.length === 1
+                            ? "Seen"
+                            : lastOwnSeenBy.length === otherMembers.length
+                              ? "Seen by everyone"
+                              : `Seen by ${lastOwnSeenBy.map((m) => m.pseudo).join(", ")}`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          {typingEntries.length > 0 && connState === "open" && (
+            <div className="flex items-end mt-2.5">
+              <div className="w-7 mr-2 flex-shrink-0">
+                <Avatar user={senderOf({ sender_id: typingEntries[0][0], sender_pseudo: typingEntries[0][1] })} size={28} />
+              </div>
+              <div className="flex flex-col items-start">
+                {otherMembers.length > 1 && (
+                  <span className="text-[11px] font-medium mb-0.5 mx-3">
+                    {typingEntries.map(([id, pseudo], i) => (
+                      <Fragment key={id}>
+                        {i > 0 && <span style={{ color: look.muted }}>, </span>}
+                        <span className={nameColor(id, look.onLight)}>{pseudo}</span>
+                      </Fragment>
+                    ))}
+                  </span>
+                )}
+                <div className="rounded-[20px] px-4 py-3 flex items-center gap-1" style={look.otherBubble}>
+                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:0ms]" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:150ms]" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:300ms]" />
                 </div>
               </div>
             </div>
-          );
-        })}
-
-        {typingEntries.length > 0 && connState === "open" && (
-          <div className="flex mt-3">
-            <div className="w-7 mr-2 flex-shrink-0">
-              <Avatar user={senderOf({ sender_id: typingEntries[0][0], sender_pseudo: typingEntries[0][1] })} size={28} />
-            </div>
-            <div className="flex flex-col items-start">
-              <span className="text-[11px] font-medium mb-0.5 ml-1">
-                {typingEntries.map(([id, pseudo], i) => (
-                  <Fragment key={id}>
-                    {i > 0 && <span style={{ color: look.muted }}>, </span>}
-                    <span className={nameColor(id, look.onLight)}>{pseudo}</span>
-                  </Fragment>
-                ))}
-                <span style={{ color: look.muted }}>
-                  {typingEntries.length === 1 ? " is typing" : " are typing"}
-                </span>
-              </span>
-              <div className="rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-1" style={look.otherBubble}>
-                <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:0ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:150ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:300ms]" />
-              </div>
-            </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       {removed ? (
@@ -1469,7 +1516,7 @@ export default function ChatPage() {
               )}
             </div>
           )}
-          <form onSubmit={handleSend} className="border-t border-neutral-800">
+          <form onSubmit={handleSend}>
             {editing && (
               <div className="flex items-center gap-3 px-4 pt-3">
                 <EditIcon className="w-4 h-4 flex-shrink-0 text-amber-400" />
@@ -1507,7 +1554,7 @@ export default function ChatPage() {
               </div>
             )}
             <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
-            <div className="px-3 sm:px-4 py-3 flex items-center gap-1 sm:gap-2">
+            <div className="px-3 pt-2 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -1519,102 +1566,99 @@ export default function ChatPage() {
                   e.target.value = "";
                 }}
               />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!!editing}
-                className="text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-xl p-2 sm:p-2.5 transition disabled:opacity-40 disabled:pointer-events-none"
-                aria-label="Add photos or videos"
-                title="Add photos or videos (or paste / drop them)"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
-                  <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={2} />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 15l-5-5L5 20" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                data-composer-panel
-                onClick={() => setPanel((p) => (p === "emoji" ? null : "emoji"))}
-                className={`rounded-xl p-2 sm:p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 ${
-                  panel === "emoji" ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
-                }`}
-                aria-label="Emoji"
-                aria-expanded={panel === "emoji"}
-                title="Emoji"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                  <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                data-composer-panel
-                onClick={() => setPanel((p) => (p === "gif" ? null : "gif"))}
-                disabled={connState !== "open" || !!editing}
-                className={`rounded-xl p-2 sm:p-2.5 transition hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-40 disabled:pointer-events-none ${
-                  panel === "gif" ? "bg-neutral-800 text-neutral-200" : "text-neutral-400"
-                }`}
-                aria-label="GIF"
-                aria-expanded={panel === "gif"}
-                title="Send a GIF"
-              >
-                <span className="flex h-5 items-center rounded border-[1.5px] border-current px-1 text-[9px] font-bold leading-none tracking-wide">
-                  GIF
-                </span>
-              </button>
-              <input
-                ref={inputRef}
-                type="text"
-                value={input}
-                onPaste={handlePaste}
-                onChange={(e) => {
-                  saveCaret(e);
-                  handleInputChange(e.target.value);
-                }}
-                onSelect={saveCaret}
-                onKeyUp={saveCaret}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
-                    if (editing) stopEditing();
-                    else if (replyTo) setReplyTo(null);
-                  }
-                  // ↑ in an empty box edits your last message, as in most desktop chat apps
-                  if (e.key === "ArrowUp" && !editing && input === "") {
-                    const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status);
-                    if (lastOwn) {
-                      e.preventDefault();
-                      startEdit(lastOwn);
+              <div className="flex items-center gap-0.5 rounded-full border border-neutral-800 bg-neutral-900 p-1 transition focus-within:border-neutral-700">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!!editing}
+                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 active:scale-95 disabled:opacity-40 disabled:pointer-events-none"
+                  aria-label="Add photos or videos"
+                  title="Add photos or videos (or paste / drop them)"
+                >
+                  <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
+                    <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={2} />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 15l-5-5L5 20" />
+                  </svg>
+                </button>
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={input}
+                  onPaste={handlePaste}
+                  onChange={(e) => {
+                    saveCaret(e);
+                    handleInputChange(e.target.value);
+                  }}
+                  onSelect={saveCaret}
+                  onKeyUp={saveCaret}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      if (editing) stopEditing();
+                      else if (replyTo) setReplyTo(null);
                     }
-                  }
-                }}
-                onClick={saveCaret}
-                placeholder={connState === "open" ? "Type a message…" : "Waiting for connection…"}
-                disabled={connState !== "open"}
-                maxLength={MAX_MESSAGE_LENGTH}
-                autoFocus
-                className="flex-1 min-w-0 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-600 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition disabled:opacity-50"
-              />
-              <button
-                type="submit"
-                disabled={
-                  editing
-                    ? savingEdit || (!input.trim() && mediaOf(editing).length === 0)
-                    : connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0)
-                }
-                className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl p-2.5 transition"
-                aria-label={editing ? "Save edit" : "Send"}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  {editing ? (
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12l5 5L20 7" />
-                  ) : (
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
-                  )}
-                </svg>
-              </button>
+                    // ↑ in an empty box edits your last message, as in most desktop chat apps
+                    if (e.key === "ArrowUp" && !editing && input === "") {
+                      const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status);
+                      if (lastOwn) {
+                        e.preventDefault();
+                        startEdit(lastOwn);
+                      }
+                    }
+                  }}
+                  onClick={saveCaret}
+                  placeholder={connState === "open" ? "Message…" : "Waiting for connection…"}
+                  disabled={connState !== "open"}
+                  maxLength={MAX_MESSAGE_LENGTH}
+                  // on phones, opening a room shouldn't pop the keyboard up
+                  autoFocus={pointerFine}
+                  enterKeyHint="send"
+                  className="flex-1 min-w-0 bg-transparent px-2 py-1.5 text-[15px] sm:text-sm text-white placeholder-neutral-500 focus:outline-none disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  data-composer-panel
+                  onClick={() => setPanel((p) => (p === "emoji" ? null : "emoji"))}
+                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white ${
+                    panel === "emoji" ? "text-white" : "text-neutral-400"
+                  }`}
+                  aria-label="Emoji"
+                  aria-expanded={panel === "emoji"}
+                  title="Emoji"
+                >
+                  <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <circle cx="12" cy="12" r="9" strokeWidth={1.8} />
+                    <path strokeLinecap="round" strokeWidth={1.8} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
+                  </svg>
+                </button>
+                {hasDraft ? (
+                  <button
+                    type="submit"
+                    disabled={sendDisabled}
+                    className="flex-shrink-0 px-3 py-1.5 text-[15px] font-semibold text-violet-400 transition hover:text-violet-300 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+                    aria-label={editing ? "Save edit" : "Send"}
+                  >
+                    {editing ? "Save" : "Send"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    data-composer-panel
+                    onClick={() => setPanel((p) => (p === "gif" ? null : "gif"))}
+                    disabled={connState !== "open"}
+                    className={`flex h-9 w-10 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${
+                      panel === "gif" ? "text-white" : "text-neutral-400"
+                    }`}
+                    aria-label="GIF"
+                    aria-expanded={panel === "gif"}
+                    title="Send a GIF"
+                  >
+                    <span className="flex h-5 items-center rounded-md border-[1.5px] border-current px-1 text-[9px] font-bold leading-none tracking-wide">
+                      GIF
+                    </span>
+                  </button>
+                )}
+              </div>
             </div>
           </form>
         </div>
@@ -1662,85 +1706,81 @@ export default function ChatPage() {
         />
       )}
 
-      {/* Long-press reaction overlay */}
-      {contextMsg && (() => {
-        const isOwn = contextMsg.sender_id === user.id;
-        const myReaction = contextMsg.reactions.find((r) => r.user_id === user.id);
+      {menu && (() => {
+        // the latest copy, so reactions update while the menu is open
+        const msg = messages.find((m) => m.id === menu.msg.id) ?? menu.msg;
+        const isOwn = msg.sender_id === user.id;
+        const actions: MessageAction[] = [
+          { label: "Reply", icon: <ReplyIcon className="w-5 h-5" />, onSelect: () => startReply(msg) },
+          ...(msg.content
+            ? [{ label: "Copy", icon: <CopyIcon className="w-5 h-5" />, onSelect: () => copyText(msg.content) }]
+            : []),
+          ...(isOwn ? [{ label: "Edit", icon: <EditIcon className="w-5 h-5" />, onSelect: () => startEdit(msg) }] : []),
+          ...(msg.edited_at
+            ? [{ label: "Edit history", icon: <HistoryIcon className="w-5 h-5" />, onSelect: () => openHistory(msg) }]
+            : []),
+        ];
         return (
-          <div
-            className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 px-6"
-            style={{ backdropFilter: "blur(8px)", backgroundColor: "rgba(0,0,0,0.6)" }}
-            onClick={() => setContextMsg(null)}
-          >
-            {/* Frozen bubble */}
-            <div
-              style={isOwn ? look.ownBubble : look.otherBubble}
-              className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm pointer-events-none ${
-                isOwn ? "rounded-br-md self-end" : "rounded-bl-md self-start"
-              }`}
-            >
-              {!isOwn && <p className="text-[11px] font-semibold mb-0.5 opacity-80">{contextMsg.sender_pseudo}</p>}
-              <p className="whitespace-pre-wrap">
-                {contextMsg.content ||
-                  mediaSummary(
-                    contextMsg.attachments.length,
-                    contextMsg.attachments.filter(isVideo).length,
-                    !!contextMsg.gif
-                  )}
-              </p>
-              <div className={`flex items-center gap-1 mt-1 ${isOwn ? "justify-end" : ""}`}>
-                <span className="text-[10px] opacity-70">{formatTime(contextMsg.sent_at)}</span>
-              </div>
-            </div>
-
-            {/* Emoji strip */}
-            <div onClick={(e) => e.stopPropagation()}>
-              <ReactionBar
-                selected={myReaction?.emoji}
-                onPick={(emoji) => handleReact(contextMsg.id, emoji)}
-                onMore={() => {
-                  setContextMsg(null);
-                  setReactionPickerFor(contextMsg.id);
-                }}
-              />
-            </div>
-
-            <div className="flex flex-wrap justify-center gap-2" onClick={(e) => e.stopPropagation()}>
-              <button
-                type="button"
-                onClick={() => startReply(contextMsg)}
-                className="flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
-              >
-                <ReplyIcon className="w-4 h-4" />
-                Reply
-              </button>
-              {isOwn && (
-                <button
-                  type="button"
-                  onClick={() => startEdit(contextMsg)}
-                  className="flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
-                >
-                  <EditIcon className="w-4 h-4" />
-                  Edit
-                </button>
-              )}
-              {contextMsg.edited_at && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setContextMsg(null);
-                    setHistoryFor(contextMsg.id);
-                  }}
-                  className="rounded-full border border-neutral-700 bg-neutral-900 px-4 py-2 text-sm text-neutral-200 shadow-2xl"
-                >
-                  Edit history
-                </button>
-              )}
-            </div>
-          </div>
+          <MessageMenu
+            bubble={menu.bubble}
+            isOwn={isOwn}
+            timeLabel={formatFull(msg.sent_at)}
+            selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
+            actions={actions}
+            onReact={(emoji) => handleReact(msg.id, emoji)}
+            onMoreReactions={() => {
+              setMenu(null);
+              setReactionPickerFor(msg.id);
+            }}
+            onClose={closeMenu}
+          />
         );
       })()}
+
+      {reactionsFor && (() => {
+        const msg = messages.find((m) => m.id === reactionsFor);
+        if (!msg || msg.reactions.length === 0) return null;
+        const mine = msg.reactions.find((r) => r.user_id === user.id);
+        return (
+          <ReactionsSheet
+            reactions={msg.reactions}
+            currentUserId={user.id}
+            personOf={(id) => memberById.get(id) ?? { id, pseudo: "Former member", avatar_id: null }}
+            onRemoveMine={() => {
+              setReactionsFor(null);
+              if (mine) handleReact(msg.id, mine.emoji);
+            }}
+            onClose={closeReactions}
+          />
+        );
+      })()}
+
+      {toast && (
+        <div
+          role="status"
+          className="pointer-events-none fixed bottom-24 left-1/2 z-[70] -translate-x-1/2 rounded-full bg-neutral-800/95 px-4 py-2 text-sm text-white shadow-xl [animation:fade-in_150ms_both]"
+        >
+          {toast}
+        </div>
+      )}
     </div>
+  );
+}
+
+function CopyIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <rect x="9" y="9" width="11" height="11" rx="2.5" strokeWidth={2} />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 9V6.5A2.5 2.5 0 0012.5 4h-6A2.5 2.5 0 004 6.5v6A2.5 2.5 0 006.5 15H9" />
+    </svg>
+  );
+}
+
+function HistoryIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 12a8 8 0 102.3-5.6M4 4v4h4M12 8v4l3 2" />
+    </svg>
   );
 }
 
@@ -1757,63 +1797,6 @@ function ReplyIcon({ className }: { className?: string }) {
     <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 14L4 9l5-5M4 9h10a6 6 0 016 6v4" />
     </svg>
-  );
-}
-
-function ReactionBar({
-  selected,
-  onPick,
-  onMore,
-  compact = false,
-}: {
-  selected?: string;
-  onPick: (emoji: string) => void;
-  onMore: () => void;
-  compact?: boolean;
-}) {
-  const button = `leading-none flex items-center justify-center rounded-full transition hover:scale-125 active:scale-110 ${
-    compact ? "text-xl w-9 h-9 hover:bg-neutral-800" : "text-2xl w-9 h-9"
-  }`;
-  // a reaction picked from the full picker isn't one of the shortcuts
-  const custom = selected && !EMOJIS.includes(selected) ? selected : null;
-
-  return (
-    <div
-      className={`flex items-center bg-neutral-900 border border-neutral-700 rounded-full shadow-2xl ${
-        compact ? "gap-0.5 px-1.5 py-1" : "gap-0.5 px-2 py-2"
-      }`}
-    >
-      {EMOJIS.map((emoji) => (
-        <button
-          key={emoji}
-          type="button"
-          onClick={() => onPick(emoji)}
-          className={`${button} ${selected === emoji ? "bg-violet-600/30 ring-2 ring-violet-500 scale-110" : ""}`}
-        >
-          {emoji}
-        </button>
-      ))}
-      {custom && (
-        <button
-          type="button"
-          onClick={() => onPick(custom)}
-          className={`${button} bg-violet-600/30 ring-2 ring-violet-500 scale-110`}
-        >
-          {custom}
-        </button>
-      )}
-      <button
-        type="button"
-        onClick={onMore}
-        className={`${button} text-neutral-400 hover:text-neutral-200`}
-        aria-label="More emojis"
-        title="More emojis"
-      >
-        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v14M5 12h14" />
-        </svg>
-      </button>
-    </div>
   );
 }
 

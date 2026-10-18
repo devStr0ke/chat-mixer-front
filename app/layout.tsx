@@ -22,6 +22,11 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
+  // the page (and the message box) shrinks above the on-screen keyboard
+  interactiveWidget: "resizes-content",
+  // full screen under iPhone notches; padding uses the safe-area insets
+  viewportFit: "cover",
+  themeColor: "#0a0a0a",
 };
 
 export default function RootLayout({
