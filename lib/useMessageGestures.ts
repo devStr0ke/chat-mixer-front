@@ -1,11 +1,11 @@
 "use client";
 
-import { useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 const HOLD_MS = 380;
 const SLOP = 8; // movement (px) that turns a press into a drag
-const LOCK = 10; // movement (px) after which the drag's direction is decided
-const REPLY_AT = 56; // swipe distance (px) that triggers a reply
+const LOCK = 8; // movement (px) after which the drag's direction is decided
+const REPLY_AT = 44; // swipe distance (px) that triggers a reply
 const REVEAL_AT = 52; // swipe distance (px) that fully shows the times
 const DOUBLE_TAP_MS = 300;
 const SETTLE_MS = 200;
@@ -17,10 +17,12 @@ type Gesture = {
   touch: boolean;
   x: number;
   y: number;
-  // the message pressed, when the press started on a sent message's bubble
+  // the sent message whose row was pressed (anywhere on the row: swipes)
   id: string | null;
   bubble: HTMLElement | null;
   row: HTMLElement | null;
+  // pressed on the bubble itself (long-press and double-tap)
+  onBubble: boolean;
   mode: Mode;
   armed: boolean; // swiped far enough to reply on release
   held: boolean; // the long-press fired
@@ -76,13 +78,14 @@ function settle(el: Element | null | undefined) {
  * - swipe a message right → reply to it
  * - swipe the list left → every message's time slides in from the right
  *
- * The list must be `touch-action: pan-y pinch-zoom`, so vertical scrolling
- * and zooming stay with the browser and horizontal drags come here. Rows are
+ * The list (`listRef`) must be `touch-action: pan-y`, so vertical scrolling
+ * stays with the browser and horizontal drags come here. Rows are
  * `[data-message-id]`, sent messages' bubbles `[data-bubble]`, the part of a
  * row that moves `[data-shift]`, the reply arrow `[data-reply-cue]`; the
  * element that slides left to show times is `revealRef`.
  */
 export function useMessageGestures(
+  listRef: React.RefObject<HTMLElement | null>,
   revealRef: React.RefObject<HTMLElement | null>,
   handlers: MessageGestureHandlers
 ) {
@@ -94,6 +97,25 @@ export function useMessageGestures(
   useLayoutEffect(() => {
     handlersRef.current = handlers;
   });
+
+  // once a swipe has started, the page must not scroll under it. touch-action
+  // covers most browsers; this covers the rest (it needs a non-passive
+  // listener, which React's onTouchMove isn't). The list mounts after the
+  // room loads, so the listener follows whichever element is current.
+  const attached = useRef<HTMLElement | null>(null);
+  // one listener for the hook's lifetime, so it can be removed again
+  const [blockScroll] = useState(() => (e: TouchEvent) => {
+    const g = gesture.current;
+    if (g && (g.held || g.mode === "reply" || g.mode === "reveal")) e.preventDefault();
+  });
+  useEffect(() => {
+    const el = listRef.current;
+    if (el === attached.current) return;
+    attached.current?.removeEventListener("touchmove", blockScroll);
+    el?.addEventListener("touchmove", blockScroll, { passive: false });
+    attached.current = el;
+  });
+  useEffect(() => () => attached.current?.removeEventListener("touchmove", blockScroll), [blockScroll]);
 
   function end(g: Gesture) {
     if (g.timer) clearTimeout(g.timer);
@@ -109,9 +131,10 @@ export function useMessageGestures(
       lastPointerTouch.current = e.pointerType !== "mouse";
       if (e.button !== 0 || gesture.current) return;
       const target = e.target as Element;
-      const bubble = target.closest<HTMLElement>("[data-bubble]");
-      const row = bubble?.closest<HTMLElement>("[data-message-id]") ?? null;
-      const id = bubble && row ? (row.dataset.messageId ?? null) : null;
+      const row = target.closest<HTMLElement>("[data-message-id]");
+      // only sent messages are marked (a pending one can't be replied to yet)
+      const bubble = row?.querySelector<HTMLElement>("[data-bubble]") ?? null;
+      const id = bubble ? (row?.dataset.messageId ?? null) : null;
       const g: Gesture = {
         pointerId: e.pointerId,
         touch: e.pointerType !== "mouse",
@@ -120,12 +143,13 @@ export function useMessageGestures(
         id,
         bubble,
         row,
+        onBubble: !!bubble && bubble.contains(target),
         mode: "pending",
         armed: false,
         held: false,
         timer: null,
       };
-      if (g.touch && id && bubble) {
+      if (g.touch && g.onBubble && id && bubble) {
         g.timer = setTimeout(() => {
           g.timer = null;
           g.held = true;
@@ -150,7 +174,8 @@ export function useMessageGestures(
       if (!g.touch) return;
 
       if (g.mode === "pending") {
-        if (Math.abs(dx) > LOCK && Math.abs(dx) > Math.abs(dy) * 1.4) {
+        // anything closer to horizontal than vertical is a swipe
+        if (Math.abs(dx) > LOCK && Math.abs(dx) > Math.abs(dy)) {
           g.mode = dx < 0 ? "reveal" : g.id ? "reply" : "scroll";
         } else if (Math.abs(dy) > LOCK) {
           g.mode = "scroll";
@@ -185,7 +210,7 @@ export function useMessageGestures(
       if (g.mode === "reply" && g.armed && g.id) handlersRef.current.onSwipeReply(g.id);
       end(g);
 
-      if (tapped && g.id && g.bubble) {
+      if (tapped && g.onBubble && g.id && g.bubble) {
         const now = Date.now();
         const last = lastTap.current;
         if (last?.id === g.id && now - last.time < DOUBLE_TAP_MS) {

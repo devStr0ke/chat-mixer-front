@@ -210,7 +210,7 @@ export default function ChatPage() {
 
   const closeMenu = useCallback(() => setMenu(null), []);
   const closeReactions = useCallback(() => setReactionsFor(null), []);
-  const gestures = useMessageGestures(revealRef, {
+  const gestures = useMessageGestures(scrollRef, revealRef, {
     onLongPress: (id, bubble) => {
       const msg = messagesRef.current.find((m) => m.id === id);
       if (!msg) return;
@@ -1191,7 +1191,7 @@ export default function ChatPage() {
         onScroll={handleScroll}
         onClick={() => setShowMenu(false)}
         {...gestures}
-        className="flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 py-4 [touch-action:pan-y_pinch-zoom] pointer-coarse:select-none pointer-coarse:[-webkit-touch-callout:none]"
+        className="flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 py-4 [touch-action:pan-y] pointer-coarse:select-none pointer-coarse:[-webkit-touch-callout:none]"
         style={{ scrollBehavior: "auto", ...look.container }}
       >
         {hasMore && (
