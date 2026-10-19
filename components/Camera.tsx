@@ -21,8 +21,8 @@ function cameraError(err: unknown): string {
 
 /**
  * Snapchat-style camera. Unlike the phone's own camera app, a selfie comes
- * out exactly as it looked on screen (mirrored), and the photo is cropped to
- * what was shown.
+ * out exactly as it looked on screen (mirrored). The whole camera frame is
+ * shown and kept, so nothing is cropped or zoomed.
  */
 export function Camera({
   onSend,
@@ -53,8 +53,11 @@ export function Camera({
     streamRef.current = null;
     (async () => {
       try {
+        // the camera's own 16:9 size, in landscape numbers: Safari turns it upright
+        // for a phone held vertically. Asking for any other shape (a square, or
+        // portrait numbers) makes it crop the picture, which looks zoomed in.
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1920 } },
+          video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
         });
         if (cancelled) return stop(stream);
@@ -97,24 +100,18 @@ export function Camera({
   function capture() {
     const video = videoRef.current;
     if (!video || !video.videoWidth) return;
-    const { videoWidth: vw, videoHeight: vh } = video;
-    // the preview fills the screen (object-fit: cover): keep exactly the part that was visible
-    const box = video.getBoundingClientRect();
-    const ratio = box.width / box.height;
-    let sw = vw;
-    let sh = vh;
-    if (vw / vh > ratio) sw = vh * ratio;
-    else sh = vw / ratio;
+    // the whole frame, as shown (the size the element reports, which is the
+    // upright picture even when the track's settings say otherwise)
     const canvas = document.createElement("canvas");
-    canvas.width = Math.round(sw);
-    canvas.height = Math.round(sh);
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     if (mirrored) {
       ctx.translate(canvas.width, 0);
       ctx.scale(-1, 1);
     }
-    ctx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     setFlash(true);
     setTimeout(() => setFlash(false), 120);
@@ -158,11 +155,11 @@ export function Camera({
         muted
         onPlaying={() => setLive(true)}
         onPointerUp={handlePreviewTap}
-        className={`absolute inset-0 h-full w-full object-cover ${mirrored ? "-scale-x-100" : ""} ${shot ? "invisible" : ""}`}
+        className={`absolute inset-0 h-full w-full object-contain ${mirrored ? "-scale-x-100" : ""} ${shot ? "invisible" : ""}`}
       />
       {shot && (
         // eslint-disable-next-line @next/next/no-img-element -- the photo just taken (local blob)
-        <img src={shot.url} alt="" className="absolute inset-0 h-full w-full object-cover" />
+        <img src={shot.url} alt="" className="absolute inset-0 h-full w-full object-contain" />
       )}
       {flash && <div className="pointer-events-none absolute inset-0 bg-white/80" />}
 
