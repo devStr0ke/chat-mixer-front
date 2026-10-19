@@ -83,7 +83,14 @@ export function useAttachmentUploads(roomId: string, onError: (message: string) 
 
         const controller = new AbortController();
         abortsRef.current.set(key, controller);
-        const onProgress = (progress: number) => update(key, { progress });
+        // a re-render per percent, not per network event
+        let percent = -1;
+        const onProgress = (progress: number) => {
+          const next = Math.floor(progress * 100);
+          if (next === percent) return;
+          percent = next;
+          update(key, { progress });
+        };
 
         (async () => {
           try {

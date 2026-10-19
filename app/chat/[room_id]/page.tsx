@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import { Fragment, memo, useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import dynamic from "next/dynamic";
 import { useParams, useRouter } from "next/navigation";
 import {
@@ -27,6 +27,7 @@ import {
   type MessageGif,
   type ReplyPreview,
   type MessageSticker,
+  type GifKind,
   type WsOutgoing,
   type WsIncoming,
 } from "@/lib/api";
@@ -52,6 +53,7 @@ import { ViewOnceBubble, ViewOnceIcon, ViewOnceViewer, OpenersSheet, type ViewOn
 import { Camera } from "@/components/Camera";
 import { Sheet } from "@/components/Sheet";
 import { StickerMaker } from "@/components/StickerMaker";
+import { DrawPad } from "@/components/DrawPad";
 import { resolveTheme } from "@/lib/theme";
 
 // loaded on first use: most visits never open the picker
@@ -74,8 +76,11 @@ type ChatMessage = Omit<Message, "attachments"> & {
   status?: "pending" | "failed";
 };
 
-const MAX_RECONNECTS = 10;
-const RECONNECT_DELAY = 2000;
+// reconnecting never gives up: 1s, 2s, 4s… then every 30s, and right away on coming back
+const RECONNECT_DELAY = 1000;
+const MAX_RECONNECT_DELAY = 30_000;
+// back from this long in the background, a phone's socket may look open and be dead: start a fresh one
+const STALE_AFTER_HIDDEN = 15_000;
 const TYPING_THROTTLE = 3000;
 const TYPING_TIMEOUT = 4000;
 const LOAD_OLDER_THRESHOLD = 80;
@@ -83,6 +88,7 @@ const NEAR_BOTTOM = 120;
 // a pause this long between messages gets a timestamp, as on Instagram
 const STAMP_GAP = 30 * 60 * 1000;
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_INPUT_HEIGHT = 120; // px: about five lines
 
 function isStatus(err: unknown, status: number): boolean {
   return (err as { status?: number } | null)?.status === status;
@@ -99,6 +105,7 @@ function replyPreviewOf(msg: ChatMessage): ReplyPreview {
     video_count: msg.attachments.filter(isVideo).length,
     has_gif: !!msg.gif,
     sticker: !!msg.gif?.sticker || !!msg.sticker,
+    drawing: msg.sticker?.kind === "drawing",
     view_once: !!msg.view_once,
     deleted: !!msg.deleted,
   };
@@ -107,7 +114,10 @@ function replyPreviewOf(msg: ChatMessage): ReplyPreview {
 /** One-line description of a quoted message. */
 function replySnippet(reply: ReplyPreview): string {
   if (reply.deleted) return "Deleted message";
-  return reply.content || mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once, reply.sticker);
+  return (
+    reply.content ||
+    mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once, reply.sticker, reply.drawing)
+  );
 }
 
 /** What a message shows as media: its GIF, or its uploaded photos and videos. */
@@ -195,6 +205,9 @@ export default function ChatPage() {
   const [stickerSource, setStickerSource] = useState<File | null>(null);
   // bumped when a sticker is created, so the picker reloads "My stickers"
   const [stickersVersion, setStickersVersion] = useState(0);
+  const [drawing, setDrawing] = useState(false);
+  // how the GIF/sticker picker opens: from the search button, on stickers with the typed text
+  const [pickerStart, setPickerStart] = useState<{ kind: GifKind; query: string; key: number } | null>(null);
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
   const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
@@ -214,8 +227,12 @@ export default function ChatPage() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const reconnectCountRef = useRef(0);
+  // messages written while (re)connecting, sent as soon as the socket opens
+  const outboxRef = useRef<WsOutgoing[]>([]);
+  // client ids sent and not acknowledged yet: only those can be lost with a socket
+  const inFlightRef = useRef(new Set<string>());
   const localIdRef = useRef(0);
   const lastTypingSentRef = useRef(0);
   const typingTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
@@ -243,6 +260,34 @@ export default function ChatPage() {
   const scrollModeRef = useRef<"none" | "bottom" | "restore">("none");
   const restoreRef = useRef({ height: 0, top: 0 });
 
+  // The message box grows with what's typed, up to about five lines, then
+  // scrolls. An empty box is always one line: measuring it would measure the
+  // placeholder, which can wrap on a narrow screen and leave the box tall.
+  const fitInput = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    if (!el.value) {
+      el.style.height = "";
+      return;
+    }
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, MAX_INPUT_HEIGHT)}px`;
+  }, []);
+  useLayoutEffect(fitInput, [input, room, fitInput]);
+  // …and again when its width changes (buttons hiding or showing, rotating the phone)
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      fitInput();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [room, fitInput]);
+
   const closeMenu = useCallback(() => setMenu(null), []);
   const closeReactions = useCallback(() => setReactionsFor(null), []);
   const closeViewer = useCallback(() => setViewing(null), []);
@@ -250,6 +295,7 @@ export default function ChatPage() {
   const closeCamera = useCallback(() => setCameraOpen(false), []);
   const closeDelete = useCallback(() => setDeleteFor(null), []);
   const closeStickerMaker = useCallback(() => setStickerSource(null), []);
+  const closeDrawing = useCallback(() => setDrawing(false), []);
   const gestures = useMessageGestures(scrollRef, revealRef, {
     onLongPress: (id, bubble) => {
       const msg = messagesRef.current.find((m) => m.id === id);
@@ -271,6 +317,16 @@ export default function ChatPage() {
   function wsSend(payload: WsOutgoing) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(payload));
+    }
+  }
+
+  /** Sends a message now, or as soon as the socket is (re)connected. */
+  function transmit(payload: Extract<WsOutgoing, { type: "message" }>) {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload));
+      inFlightRef.current.add(payload.client_id);
+    } else {
+      outboxRef.current.push(payload);
     }
   }
 
@@ -389,11 +445,17 @@ export default function ChatPage() {
       wsRef.current = ws;
 
       ws.addEventListener("open", () => {
-        if (cancelled) return;
+        if (cancelled || wsRef.current !== ws) return;
         const isReconnect = reconnectCountRef.current > 0;
         reconnectCountRef.current = 0;
         setConnState("open");
         lastReadSentRef.current = null;
+        // what was written meanwhile goes out now
+        for (const payload of outboxRef.current) {
+          ws.send(JSON.stringify(payload));
+          if (payload.type === "message") inFlightRef.current.add(payload.client_id);
+        }
+        outboxRef.current = [];
         if (isReconnect) {
           catchUp();
         } else {
@@ -402,7 +464,7 @@ export default function ChatPage() {
       });
 
       ws.addEventListener("message", (e) => {
-        if (cancelled) return;
+        if (cancelled || wsRef.current !== ws) return;
         let incoming: WsIncoming;
         try {
           incoming = JSON.parse(e.data);
@@ -435,6 +497,7 @@ export default function ChatPage() {
           }
 
           case "message_ack":
+            inFlightRef.current.delete(incoming.client_id);
             setMessages((prev) =>
               prev.map((m) =>
                 m.client_id === incoming.client_id
@@ -445,6 +508,7 @@ export default function ChatPage() {
             break;
 
           case "message_error":
+            inFlightRef.current.delete(incoming.client_id);
             setMessages((prev) =>
               prev.map((m) => (m.client_id === incoming.client_id ? { ...m, status: "failed" } : m))
             );
@@ -502,16 +566,12 @@ export default function ChatPage() {
       });
 
       ws.addEventListener("close", async (e) => {
-        if (cancelled) return;
+        // a socket replaced on resume closes on its own time: nothing to do
+        if (cancelled || wsRef.current !== ws) return;
         console.warn(`[WS] closed code=${e.code} reason=${e.reason} attempt=${reconnectCountRef.current}`);
         wsRef.current = null;
         setTypingUsers({});
-        // anything still waiting for an ack may or may not have been saved
-        setMessages((prev) =>
-          prev.some((m) => m.status === "pending")
-            ? prev.map((m) => (m.status === "pending" ? { ...m, status: "failed" } : m))
-            : prev
-        );
+        failInFlight();
 
         if (removedRef.current) return;
 
@@ -524,20 +584,61 @@ export default function ChatPage() {
           }
         }
 
-        if (reconnectCountRef.current < MAX_RECONNECTS) {
-          reconnectCountRef.current += 1;
-          setConnState("connecting");
-          reconnectTimer = setTimeout(connectWs, RECONNECT_DELAY);
-        } else {
-          setConnState("closed");
-        }
+        if (cancelled || wsRef.current) return; // resumed meanwhile
+        const delay = Math.min(MAX_RECONNECT_DELAY, RECONNECT_DELAY * 2 ** Math.min(reconnectCountRef.current, 5));
+        reconnectCountRef.current += 1;
+        setConnState("connecting");
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connectWs, delay);
       });
     }
+
+    // sent but never acknowledged: maybe saved, maybe not, so the user decides (tap to retry)
+    function failInFlight() {
+      const lost = inFlightRef.current;
+      if (lost.size === 0) return;
+      inFlightRef.current = new Set();
+      setMessages((prev) =>
+        prev.map((m) => (m.client_id && lost.has(m.client_id) && m.status === "pending" ? { ...m, status: "failed" } : m))
+      );
+    }
+
+    // coming back to the app (or the network coming back): reconnect now rather than at
+    // the next retry, and replace a socket that may have died while the phone slept
+    let hiddenAt = 0;
+    function resume() {
+      if (cancelled || removedRef.current) return;
+      const ws = wsRef.current;
+      if (!ws) {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        connectWs();
+        return;
+      }
+      if (ws.readyState === WebSocket.OPEN && hiddenAt && Date.now() - hiddenAt > STALE_AFTER_HIDDEN) {
+        failInFlight();
+        reconnectCountRef.current = Math.max(reconnectCountRef.current, 1); // so the new one catches up
+        wsRef.current = null;
+        ws.close();
+        connectWs();
+      }
+    }
+    function handleVisibility() {
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+      } else {
+        resume();
+        hiddenAt = 0;
+      }
+    }
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("online", resume);
 
     init();
 
     return () => {
       cancelled = true;
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("online", resume);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       Object.values(typingTimers).forEach(clearTimeout);
       if (wsRef.current) {
@@ -684,7 +785,7 @@ export default function ChatPage() {
     if (!user) return;
     localIdRef.current += 1;
     const clientId = `local-${Date.now()}-${localIdRef.current}`;
-    wsSend({
+    transmit({
       type: "message",
       content: text,
       client_id: clientId,
@@ -722,7 +823,6 @@ export default function ChatPage() {
     }
     const text = input.trim();
     if (composer.blocked || (!text && composer.ready === 0)) return;
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     const picked = composer.take();
     if (viewOnce && picked.length > 0) {
       // each photo or video is its own view-once message; any text follows normally
@@ -741,7 +841,6 @@ export default function ChatPage() {
   }
 
   function handleRetry(msg: ChatMessage) {
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
     sendContent(msg.content, msg.attachments, msg.gif, msg.reply_to, !!msg.view_once, msg.sticker ?? null);
   }
@@ -844,15 +943,36 @@ export default function ChatPage() {
 
   // picking a GIF sends it straight away, like other chat apps
   function sendGif(gif: Gif) {
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     sendContent("", [], { id: gif.id, url: gif.url, width: gif.width, height: gif.height, sticker: gif.sticker }, takeReply());
-    setPanel(null);
+    closePicker();
   }
 
   function sendSticker(sticker: MessageSticker) {
-    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     sendContent("", [], null, takeReply(), false, sticker);
+    closePicker();
+  }
+
+  /** After sending from the picker: text typed only to search for it goes too. */
+  function closePicker() {
     setPanel(null);
+    if (pickerStart?.query && input.trim() === pickerStart.query) {
+      setInput("");
+      caretRef.current = null;
+    }
+    setPickerStart(null);
+  }
+
+  /** While typing, the camera button becomes a search: stickers matching the text, as on Instagram. */
+  function searchStickers() {
+    setPickerStart({ kind: "stickers", query: input.trim().slice(0, 100), key: Date.now() });
+    setPanel("gif");
+  }
+
+  /** The drawing pad's Send: stored like a sticker, but not in your collection. */
+  async function sendDrawing(image: Blob, display: { width: number; height: number }) {
+    const sticker = await createSticker(image, "drawing", display);
+    sendContent("", [], null, takeReply(), false, sticker);
+    setDrawing(false);
   }
 
   async function saveSticker(image: Blob) {
@@ -866,7 +986,7 @@ export default function ChatPage() {
     return Array.from(list ?? []).filter((f) => f.type.startsWith("image/") || isVideoFile(f));
   }
 
-  function handlePaste(e: React.ClipboardEvent<HTMLInputElement>) {
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     const files = mediaFiles(e.clipboardData.files);
     if (files.length === 0 || editing) return;
     e.preventDefault();
@@ -897,7 +1017,7 @@ export default function ChatPage() {
     setLightbox({ items: mediaOf(msg), index });
   }
 
-  function saveCaret(e: React.SyntheticEvent<HTMLInputElement>) {
+  function saveCaret(e: React.SyntheticEvent<HTMLTextAreaElement>) {
     const el = e.currentTarget;
     caretRef.current = { start: el.selectionStart ?? el.value.length, end: el.selectionEnd ?? el.value.length };
   }
@@ -969,10 +1089,6 @@ export default function ChatPage() {
   /** The camera's Send: the photo goes out on its own, like a snap. */
   async function sendPhoto(file: File, once: boolean) {
     setCameraOpen(false);
-    if (wsRef.current?.readyState !== WebSocket.OPEN) {
-      showToast("Not connected, the photo wasn't sent.");
-      return;
-    }
     showToast("Sending…");
     try {
       const attachment = await composer.uploadNow(file);
@@ -1135,6 +1251,31 @@ export default function ChatPage() {
     }
   }
 
+  // the message list calls back through this ref, so it never needs re-rendering for new closures
+  const listActions = useRef<ListActions | null>(null);
+  // no deps on purpose: after every render, so the list always calls the latest functions
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    listActions.current = {
+      jumpToMessage,
+      openLightbox,
+      openOnce,
+      openHistory,
+      handleReact,
+      handleRetry,
+      startReply,
+      startEdit,
+      togglePicker,
+      setPicker,
+      setReactionPickerFor,
+      setReactionsFor,
+      setDeleteFor,
+      setOpenersFor,
+      setBurst,
+      repinToBottom,
+    };
+  });
+
   if (error && !room) {
     return (
       <div className="min-h-dvh bg-neutral-950 flex flex-col items-center justify-center px-4 gap-4">
@@ -1168,31 +1309,18 @@ export default function ChatPage() {
     return memberById.get(msg.sender_id) ?? { id: msg.sender_id, pseudo: msg.sender_pseudo, avatar_id: null };
   }
 
-  function seenBy(msg: ChatMessage): Member[] {
-    const sent = new Date(msg.sent_at).getTime();
-    return otherMembers.filter((m) => new Date(m.last_read_at).getTime() >= sent);
-  }
-
-  /** Under your own view-once message: who has opened it. */
-  function openersLabel(msg: ChatMessage): string {
-    const openers = (msg.opens ?? []).filter((o) => o.user_id !== user!.id);
-    if (openers.length === 0) return msg.expired ? "Expired" : "Not opened yet";
-    if (otherMembers.length <= 1) return "Opened";
-    if (openers.length >= otherMembers.length) return "Opened by everyone";
-    return `Opened by ${openers.map((o) => memberById.get(o.user_id)?.pseudo ?? "a former member").join(", ")}`;
-  }
-
   function personOf(id: string) {
     return memberById.get(id) ?? { id, pseudo: "Former member", avatar_id: null };
   }
 
-  const lastOwnSent = messages.findLast((m) => m.sender_id === user.id && !m.status);
   // the composer shows "Send" once there's something to send
   const hasDraft = !!editing || input.trim() !== "" || composer.uploads.length > 0;
+  const typingText = input.trim() !== "";
+  // phones: while typing, the buttons make way for the text (they're back once it's empty)
+  const typingHides = !!editing || typingText ? "pointer-coarse:hidden" : "";
   const sendDisabled = editing
     ? savingEdit || (!input.trim() && mediaOf(editing).length === 0)
-    : connState !== "open" || composer.blocked || (!input.trim() && composer.ready === 0);
-  const lastOwnSeenBy = lastOwnSent ? seenBy(lastOwnSent) : [];
+    : composer.blocked || (!input.trim() && composer.ready === 0);
 
   return (
     <div
@@ -1402,346 +1530,18 @@ export default function ChatPage() {
           </div>
         )}
 
-        <div ref={revealRef}>
-          {messages.map((msg, i) => {
-            const prev = messages[i - 1];
-            const next = messages[i + 1];
-            const isOwn = msg.sender_id === user.id;
-            const confirmed = !msg.status;
-            const deleted = !!msg.deleted;
-            // a GIPHY sticker or one made in the app
-            const sticker = !!msg.gif?.sticker || !!msg.sticker;
-            const stamp = !prev || pauseBetween(prev, msg);
-            const joinsPrev = !stamp && prev.sender_id === msg.sender_id;
-            const joinsNext = !!next && next.sender_id === msg.sender_id && !pauseBetween(msg, next);
-            // names only matter when there's more than one other person
-            const showSender = !isOwn && !joinsPrev && otherMembers.length > 1;
-            const showAvatar = !isOwn && !joinsNext;
-            const reactionGroups = groupReactions(msg.reactions, user.id);
-            // a view-once photo is never shown in the conversation; a sticker goes without a frame
-            const media = msg.view_once || sticker ? [] : mediaOf(msg);
-            const hasAttachments = media.length > 0;
-            const bigEmoji = !hasAttachments && !msg.reply_to && isBigEmoji(msg.content);
-            // photos, videos, GIFs, stickers and emoji-only messages go without a bubble
-            const bare = !deleted && (bigEmoji || sticker || (hasAttachments && !msg.content && !msg.reply_to));
-            // one card per message, and not on top of images or a GIF
-            const previewUrl = hasAttachments ? null : firstLink(msg.content);
-            const replyCue = (
-              <span
-                data-reply-cue
-                className={`pointer-events-none absolute top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-white opacity-0 ${
-                  isOwn ? "right-full mr-3" : "left-0"
-                }`}
-              >
-                <ReplyIcon className="w-4 h-4" />
-              </span>
-            );
-
-            return (
-              <div key={msg.client_id ?? msg.id} data-message-id={msg.id}>
-                {stamp && (
-                  <p className="my-4 text-center text-[11px] font-medium" style={{ color: look.muted }}>
-                    {formatStamp(msg.sent_at)}
-                  </p>
-                )}
-
-                <div className={`relative ${joinsPrev ? "mt-0.5" : stamp ? "" : "mt-2.5"}`}>
-                  {/* slides in when the list is swiped left */}
-                  <span
-                    className="absolute top-1/2 -right-[68px] w-12 -translate-y-1/2 text-[10px] tabular-nums"
-                    style={{ color: look.muted }}
-                  >
-                    {formatTime(msg.sent_at)}
-                  </span>
-                  {/* fades in while the message is swiped right */}
-                  {!isOwn && replyCue}
-
-                  <div data-shift className={`group flex items-end ${isOwn ? "justify-end" : "justify-start"}`}>
-                    {!isOwn && (
-                      <div className="w-7 mr-2 flex-shrink-0">
-                        {showAvatar && <Avatar user={senderOf(msg)} size={28} />}
-                      </div>
-                    )}
-                    <div className={`relative min-w-0 max-w-[75%] flex flex-col ${isOwn ? "items-end" : "items-start"}`}>
-                      {showSender && (
-                        <span className={`text-[11px] font-medium mb-0.5 mx-3 ${nameColor(msg.sender_id, look.onLight)}`}>
-                          {msg.sender_pseudo}
-                        </span>
-                      )}
-                      <div className="relative">
-                        {isOwn && replyCue}
-                        <div
-                          data-bubble={confirmed && !deleted ? "" : undefined}
-                          style={
-                            deleted
-                              ? { border: `1px solid ${look.muted}`, color: look.muted }
-                              : bare
-                                ? undefined
-                                : isOwn
-                                  ? look.ownBubble
-                                  : look.otherBubble
-                          }
-                          className={`text-[15px] sm:text-sm leading-snug wrap-anywhere select-none transition-shadow duration-300 ${bubbleCorners(
-                            isOwn,
-                            joinsPrev,
-                            joinsNext
-                          )} ${bare ? (bigEmoji || sticker ? "" : "overflow-hidden") : hasAttachments ? "p-1" : "px-3.5 py-2"} ${
-                            msg.status === "pending" ? "opacity-70" : ""
-                          } ${msg.status === "failed" ? "opacity-60" : ""} ${highlightId === msg.id ? "ring-2 ring-amber-300" : ""}`}
-                        >
-                          {msg.reply_to && (
-                            <button
-                              type="button"
-                              onClick={() => jumpToMessage(msg.reply_to!.id)}
-                              title="Go to the original message"
-                              className={`block w-full rounded-xl border-l-2 border-current bg-black/15 px-2.5 py-1.5 text-left ${
-                                hasAttachments ? "mb-1" : "mb-1.5"
-                              }`}
-                            >
-                              <span className="block truncate text-[11px] font-semibold opacity-90">
-                                {msg.reply_to.sender_id === user.id ? "You" : msg.reply_to.sender_pseudo}
-                              </span>
-                              <span className="break-words text-xs opacity-75 line-clamp-2">{replySnippet(msg.reply_to)}</span>
-                            </button>
-                          )}
-                          {deleted && (
-                            <p className="flex items-center gap-1.5 italic">
-                              <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
-                                <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                                <path strokeLinecap="round" strokeWidth={2} d="M5.6 5.6l12.8 12.8" />
-                              </svg>
-                              {isOwn ? "You deleted this message" : "This message was deleted"}
-                            </p>
-                          )}
-                          {msg.sticker && (() => {
-                            const scale = Math.min(1, 150 / Math.max(msg.sticker.width, msg.sticker.height));
-                            return (
-                              // eslint-disable-next-line @next/next/no-img-element -- custom sticker (authenticated, same-origin)
-                              <img
-                                src={stickerImageUrl(msg.sticker.id)}
-                                alt="Sticker"
-                                width={Math.round(msg.sticker.width * scale)}
-                                height={Math.round(msg.sticker.height * scale)}
-                                draggable={false}
-                                className="pointer-events-none [-webkit-touch-callout:none]"
-                              />
-                            );
-                          })()}
-                          {msg.gif?.sticker && (() => {
-                            const scale = Math.min(1, 150 / Math.max(msg.gif.width, msg.gif.height));
-                            return (
-                              // eslint-disable-next-line @next/next/no-img-element -- animated sticker from GIPHY's CDN
-                              <img
-                                src={msg.gif.url}
-                                alt="Sticker"
-                                width={Math.round(msg.gif.width * scale)}
-                                height={Math.round(msg.gif.height * scale)}
-                                referrerPolicy="no-referrer"
-                                draggable={false}
-                                className="pointer-events-none [-webkit-touch-callout:none]"
-                              />
-                            );
-                          })()}
-                          {msg.view_once && (
-                            <ViewOnceBubble
-                              kind={msg.attachments[0] && isVideo(msg.attachments[0]) ? "Video" : "Photo"}
-                              state={viewOnceState(msg, isOwn, user.id)}
-                              onOpen={() => openOnce(msg)}
-                            />
-                          )}
-                          {hasAttachments && <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />}
-                          {bigEmoji ? (
-                            <p className="text-[44px] leading-tight">{msg.content}</p>
-                          ) : (
-                            msg.content && (
-                              <MessageText text={msg.content} className={hasAttachments ? "px-2.5 pt-1.5 pb-1" : ""} />
-                            )
-                          )}
-                          {previewUrl && <LinkPreviewCard url={previewUrl} onShown={repinToBottom} />}
-                        </div>
-
-                        {burst?.id === msg.id && (
-                          <span
-                            key={burst.key}
-                            className="pointer-events-none absolute inset-0 flex items-center justify-center text-5xl drop-shadow-lg [animation:heart-burst_850ms_both]"
-                            onAnimationEnd={() => setBurst(null)}
-                          >
-                            ❤️
-                          </span>
-                        )}
-
-                        {confirmed && !deleted && (
-                          <div
-                            className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 items-center gap-0.5 transition focus-within:opacity-100 ${
-                              isOwn ? "right-full mr-1.5 flex-row-reverse" : "left-full ml-1.5"
-                            } ${picker?.id === msg.id ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
-                          >
-                            <button
-                              type="button"
-                              data-reaction-picker
-                              onClick={(e) => togglePicker(msg.id, e.currentTarget)}
-                              title="Add reaction (or double-click the message for ❤️)"
-                              aria-label="Add reaction"
-                              className={`w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition ${
-                                picker?.id === msg.id ? "text-neutral-200 bg-neutral-800" : ""
-                              }`}
-                            >
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <circle cx="12" cy="12" r="9" strokeWidth={2} />
-                                <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
-                              </svg>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => startReply(msg)}
-                              title="Reply"
-                              aria-label="Reply"
-                              className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
-                            >
-                              <ReplyIcon className="w-4 h-4" />
-                            </button>
-                            {isOwn && !msg.view_once && !sticker && (
-                              <button
-                                type="button"
-                                onClick={() => startEdit(msg)}
-                                title="Edit"
-                                aria-label="Edit"
-                                className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
-                              >
-                                <EditIcon className="w-4 h-4" />
-                              </button>
-                            )}
-                            {isOwn && (
-                              <button
-                                type="button"
-                                onClick={() => setDeleteFor(msg)}
-                                title="Delete"
-                                aria-label="Delete"
-                                className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-red-400 hover:bg-neutral-800 transition"
-                              >
-                                <TrashIcon className="w-4 h-4" />
-                              </button>
-                            )}
-                            <span className="whitespace-nowrap px-1 text-[11px] tabular-nums" style={{ color: look.muted }}>
-                              {formatTime(msg.sent_at)}
-                            </span>
-                          </div>
-                        )}
-
-                        {picker?.id === msg.id && (
-                          <div
-                            data-reaction-picker
-                            className={`absolute z-30 ${picker.below ? "top-full mt-1.5" : "bottom-full mb-1.5"} ${
-                              isOwn ? "right-0" : "left-0"
-                            }`}
-                          >
-                            <ReactionBar
-                              selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
-                              onPick={(emoji) => handleReact(msg.id, emoji)}
-                              onMore={() => {
-                                setPicker(null);
-                                setReactionPickerFor(msg.id);
-                              }}
-                              compact
-                            />
-                          </div>
-                        )}
-                      </div>
-
-                      {reactionGroups.length > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => setReactionsFor(msg.id)}
-                          title={reactionGroups
-                            .map((g) => `${g.emoji} ${g.userIds.map((id) => (id === user.id ? "You" : memberById.get(id)?.pseudo ?? "Former member")).join(", ")}`)
-                            .join("   ")}
-                          aria-label={`${msg.reactions.length} reaction${msg.reactions.length > 1 ? "s" : ""}, see who reacted`}
-                          className={`relative z-10 -mt-2 flex h-[22px] items-center gap-0.5 rounded-full border-2 border-neutral-950 bg-neutral-800 px-1.5 text-[13px] leading-none shadow-sm transition active:scale-95 ${
-                            isOwn ? "mr-2" : "ml-2"
-                          }`}
-                        >
-                          {reactionGroups.slice(0, 3).map((g) => (
-                            <span key={g.emoji}>{g.emoji}</span>
-                          ))}
-                          {msg.reactions.length > 1 && (
-                            <span className="ml-0.5 text-[11px] text-neutral-300 tabular-nums">{msg.reactions.length}</span>
-                          )}
-                        </button>
-                      )}
-
-                      {msg.edited_at && (
-                        <button
-                          type="button"
-                          onClick={() => openHistory(msg)}
-                          title="See edit history"
-                          className="mx-3 mt-0.5 text-[11px] hover:underline"
-                          style={{ color: look.muted }}
-                        >
-                          Edited
-                        </button>
-                      )}
-
-                      {isOwn && msg.view_once && confirmed && (
-                        <button
-                          type="button"
-                          onClick={() => (msg.opens ?? []).some((o) => o.user_id !== user.id) && setOpenersFor(msg.id)}
-                          className="mx-3 mt-0.5 text-[11px]"
-                          style={{ color: look.muted }}
-                        >
-                          {openersLabel(msg)}
-                        </button>
-                      )}
-
-                      {msg.status === "failed" && (
-                        <button
-                          onClick={() => handleRetry(msg)}
-                          className="mx-3 mt-1 text-[11px] text-red-400 hover:text-red-300 transition"
-                        >
-                          Not sent · tap to retry
-                        </button>
-                      )}
-
-                      {msg === lastOwnSent && !msg.view_once && lastOwnSeenBy.length > 0 && (
-                        <span className="mx-3 mt-1 text-[11px]" style={{ color: look.muted }}>
-                          {otherMembers.length === 1
-                            ? "Seen"
-                            : lastOwnSeenBy.length === otherMembers.length
-                              ? "Seen by everyone"
-                              : `Seen by ${lastOwnSeenBy.map((m) => m.pseudo).join(", ")}`}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-
-          {typingEntries.length > 0 && connState === "open" && (
-            <div className="flex items-end mt-2.5">
-              <div className="w-7 mr-2 flex-shrink-0">
-                <Avatar user={senderOf({ sender_id: typingEntries[0][0], sender_pseudo: typingEntries[0][1] })} size={28} />
-              </div>
-              <div className="flex flex-col items-start">
-                {otherMembers.length > 1 && (
-                  <span className="text-[11px] font-medium mb-0.5 mx-3">
-                    {typingEntries.map(([id, pseudo], i) => (
-                      <Fragment key={id}>
-                        {i > 0 && <span style={{ color: look.muted }}>, </span>}
-                        <span className={nameColor(id, look.onLight)}>{pseudo}</span>
-                      </Fragment>
-                    ))}
-                  </span>
-                )}
-                <div className="rounded-[20px] px-4 py-3 flex items-center gap-1" style={look.otherBubble}>
-                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:0ms]" />
-                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:150ms]" />
-                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:300ms]" />
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
+        <MessageListView
+          messages={messages}
+          user={user}
+          room={room}
+          picker={picker}
+          burst={burst}
+          highlightId={highlightId}
+          typingUsers={typingUsers}
+          connState={connState}
+          revealRef={revealRef}
+          actions={listActions}
+        />
       </div>
 
       {removed ? (
@@ -1765,6 +1565,9 @@ export default function ChatPage() {
                 <EmojiPickerPanel onSelect={insertEmoji} />
               ) : (
                 <GifPicker
+                  key={pickerStart?.key ?? "default"}
+                  initialKind={pickerStart?.kind}
+                  initialQuery={pickerStart?.query}
                   onSelect={sendGif}
                   onSelectSticker={sendSticker}
                   onCreateSticker={() => stickerFileRef.current?.click()}
@@ -1857,23 +1660,39 @@ export default function ChatPage() {
                   e.target.value = "";
                 }}
               />
-              <div className="flex items-center gap-0.5 rounded-full border border-neutral-800 bg-neutral-900 p-1 transition focus-within:border-neutral-700">
-                <button
-                  type="button"
-                  onClick={() => setCameraOpen(true)}
-                  disabled={!!editing || connState !== "open"}
-                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 active:scale-95 disabled:opacity-40 disabled:pointer-events-none"
-                  aria-label="Camera"
-                  title="Take a photo"
-                >
-                  <svg className="w-[19px] h-[19px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8.5A2.5 2.5 0 016.5 6h1.2l1.3-2h6l1.3 2h1.2A2.5 2.5 0 0120 8.5v9a2.5 2.5 0 01-2.5 2.5h-11A2.5 2.5 0 014 17.5v-9z" />
-                    <circle cx="12" cy="13" r="3.5" strokeWidth={2} />
-                  </svg>
-                </button>
-                <input
+              <div className="flex items-end gap-0.5 rounded-[22px] border border-neutral-800 bg-neutral-900 p-1 transition focus-within:border-neutral-700">
+                {typingText && !editing ? (
+                  <button
+                    type="button"
+                    data-composer-panel
+                    onClick={searchStickers}
+                    className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 active:scale-95"
+                    aria-label="Search stickers"
+                    title="Search stickers and GIFs for what you're typing"
+                  >
+                    <svg className="w-[19px] h-[19px]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                      <circle cx="10.5" cy="10.5" r="6" strokeWidth={2.2} />
+                      <path strokeLinecap="round" strokeWidth={2.2} d="M15 15l5 5" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setCameraOpen(true)}
+                    disabled={!!editing}
+                    className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 active:scale-95 disabled:opacity-40 disabled:pointer-events-none ${typingHides}`}
+                    aria-label="Camera"
+                    title="Take a photo"
+                  >
+                    <svg className="w-[19px] h-[19px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8.5A2.5 2.5 0 016.5 6h1.2l1.3-2h6l1.3 2h1.2A2.5 2.5 0 0120 8.5v9a2.5 2.5 0 01-2.5 2.5h-11A2.5 2.5 0 014 17.5v-9z" />
+                      <circle cx="12" cy="13" r="3.5" strokeWidth={2} />
+                    </svg>
+                  </button>
+                )}
+                <textarea
                   ref={inputRef}
-                  type="text"
+                  rows={1}
                   value={input}
                   onPaste={handlePaste}
                   onChange={(e) => {
@@ -1887,6 +1706,12 @@ export default function ChatPage() {
                       if (editing) stopEditing();
                       else if (replyTo) setReplyTo(null);
                     }
+                    // computer: Enter sends, Shift+Enter is a new line. Phone: the
+                    // return key is a new line and the Send button sends.
+                    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && pointerFine) {
+                      e.preventDefault();
+                      e.currentTarget.form?.requestSubmit();
+                    }
                     // ↑ in an empty box edits your last message, as in most desktop chat apps
                     if (e.key === "ArrowUp" && !editing && input === "") {
                       const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status && !m.view_once && !m.deleted);
@@ -1897,19 +1722,19 @@ export default function ChatPage() {
                     }
                   }}
                   onClick={saveCaret}
-                  placeholder={connState === "open" ? "Message…" : "Waiting for connection…"}
-                  disabled={connState !== "open"}
+                  placeholder="Message…"
                   maxLength={MAX_MESSAGE_LENGTH}
                   // on phones, opening a room shouldn't pop the keyboard up
                   autoFocus={pointerFine}
-                  enterKeyHint="send"
-                  className="flex-1 min-w-0 bg-transparent px-2 py-1.5 text-[15px] sm:text-sm text-white placeholder-neutral-500 focus:outline-none disabled:opacity-50"
+                  enterKeyHint={pointerFine ? "send" : "enter"}
+                  className="block flex-1 min-w-0 resize-none overflow-y-auto bg-transparent px-2 py-2 text-[15px] leading-5 sm:text-sm text-white placeholder-neutral-500 placeholder:whitespace-nowrap focus:outline-none disabled:opacity-50"
+                  style={{ maxHeight: MAX_INPUT_HEIGHT }}
                 />
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   disabled={!!editing}
-                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${typingHides}`}
                   aria-label="Add photos or videos"
                   title="Add photos or videos (or paste / drop them)"
                 >
@@ -1919,11 +1744,30 @@ export default function ChatPage() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M21 15l-5-5L5 20" />
                   </svg>
                 </button>
+                {!hasDraft && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPanel(null);
+                      setDrawing(true);
+                    }}
+                    disabled={!!editing}
+                    className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+                    aria-label="Draw"
+                    title="Draw and send it"
+                  >
+                    <svg className="w-[21px] h-[21px]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 20l3.5-.8L19 7.7a2.1 2.1 0 00-3-3L4.5 16.2 4 20z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M14.5 6.2l3 3M13 20c2-1.5 4.5-1.5 7 0" />
+                    </svg>
+                  </button>
+                )}
                 <button
                   type="button"
                   data-composer-panel
                   onClick={() => setPanel((p) => (p === "emoji" ? null : "emoji"))}
-                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white ${
+                  // phones have emojis on their keyboard
+                  className={`hidden pointer-fine:flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white ${
                     panel === "emoji" ? "text-white" : "text-neutral-400"
                   }`}
                   aria-label="Emoji"
@@ -1948,8 +1792,10 @@ export default function ChatPage() {
                   <button
                     type="button"
                     data-composer-panel
-                    onClick={() => setPanel((p) => (p === "gif" ? null : "gif"))}
-                    disabled={connState !== "open"}
+                    onClick={() => {
+                      setPickerStart(null);
+                      setPanel((p) => (p === "gif" ? null : "gif"));
+                    }}
                     className={`flex h-9 w-10 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${
                       panel === "gif" ? "text-white" : "text-neutral-400"
                     }`}
@@ -2076,6 +1922,8 @@ export default function ChatPage() {
 
       {stickerSource && <StickerMaker file={stickerSource} onSave={saveSticker} onClose={closeStickerMaker} />}
 
+      {drawing && <DrawPad onSend={sendDrawing} onClose={closeDrawing} />}
+
       {deleteFor && (
         <Sheet title="Delete this message?" onClose={closeDelete}>
           <p className="px-6 pb-4 text-center text-sm text-neutral-400">
@@ -2194,3 +2042,446 @@ function groupReactions(reactions: Reaction[], currentUserId: string) {
   }
   return groups;
 }
+
+/** What the message list needs from the page; kept in a ref so the list doesn't re-render for it. */
+type ListActions = {
+  jumpToMessage: (id: string) => void;
+  openLightbox: (msg: ChatMessage, index: number) => void;
+  openOnce: (msg: ChatMessage) => void;
+  openHistory: (msg: ChatMessage) => void;
+  handleReact: (messageId: string, emoji: string) => void;
+  handleRetry: (msg: ChatMessage) => void;
+  startReply: (msg: ChatMessage) => void;
+  startEdit: (msg: ChatMessage) => void;
+  togglePicker: (messageId: string, anchor: Element) => void;
+  setPicker: (picker: null) => void;
+  setReactionPickerFor: (messageId: string) => void;
+  setReactionsFor: (messageId: string) => void;
+  setDeleteFor: (msg: ChatMessage) => void;
+  setOpenersFor: (messageId: string) => void;
+  setBurst: (burst: null) => void;
+  repinToBottom: () => void;
+};
+
+/**
+ * The conversation itself. Memoized: typing in the message box, upload
+ * progress, toasts or menus re-render the page, not every message; this only
+ * re-renders when the messages (or what's drawn on them) change.
+ */
+const MessageListView = memo(function MessageListView({
+  messages,
+  user,
+  room,
+  picker,
+  burst,
+  highlightId,
+  typingUsers,
+  connState,
+  revealRef,
+  actions,
+}: {
+  messages: ChatMessage[];
+  user: { id: string };
+  room: RoomDetail;
+  picker: { id: string; below: boolean } | null;
+  burst: { id: string; key: number } | null;
+  highlightId: string | null;
+  typingUsers: Record<string, string>;
+  connState: ConnectionState;
+  revealRef: React.RefObject<HTMLDivElement | null>;
+  actions: React.RefObject<ListActions | null>;
+}) {
+  const look = useMemo(() => resolveTheme(room.id, room.theme), [room]);
+  const otherMembers = room.members.filter((m) => m.id !== user.id);
+  const memberById = new Map(room.members.map((m) => [m.id, m]));
+  const typingEntries = Object.entries(typingUsers);
+
+  function senderOf(msg: Pick<ChatMessage, "sender_id" | "sender_pseudo">) {
+    return memberById.get(msg.sender_id) ?? { id: msg.sender_id, pseudo: msg.sender_pseudo, avatar_id: null };
+  }
+
+  function seenBy(msg: ChatMessage): Member[] {
+    const sent = new Date(msg.sent_at).getTime();
+    return otherMembers.filter((m) => new Date(m.last_read_at).getTime() >= sent);
+  }
+
+  /** Under your own view-once message: who has opened it. */
+  function openersLabel(msg: ChatMessage): string {
+    const openers = (msg.opens ?? []).filter((o) => o.user_id !== user.id);
+    if (openers.length === 0) return msg.expired ? "Expired" : "Not opened yet";
+    if (otherMembers.length <= 1) return "Opened";
+    if (openers.length >= otherMembers.length) return "Opened by everyone";
+    return `Opened by ${openers.map((o) => memberById.get(o.user_id)?.pseudo ?? "a former member").join(", ")}`;
+  }
+
+  const lastOwnSent = messages.findLast((m) => m.sender_id === user.id && !m.status);
+  const lastOwnSeenBy = lastOwnSent ? seenBy(lastOwnSent) : [];
+
+  return (
+  <div ref={revealRef}>
+    {messages.map((msg, i) => {
+      const prev = messages[i - 1];
+      const next = messages[i + 1];
+      const isOwn = msg.sender_id === user.id;
+      const confirmed = !msg.status;
+      const deleted = !!msg.deleted;
+      // a GIPHY sticker or one made in the app
+      const sticker = !!msg.gif?.sticker || !!msg.sticker;
+      // a drawing spans the conversation, where it was drawn
+      const isDrawing = msg.sticker?.kind === "drawing";
+      const stamp = !prev || pauseBetween(prev, msg);
+      const joinsPrev = !stamp && prev.sender_id === msg.sender_id;
+      const joinsNext = !!next && next.sender_id === msg.sender_id && !pauseBetween(msg, next);
+      // names only matter when there's more than one other person
+      const showSender = !isOwn && !joinsPrev && otherMembers.length > 1;
+      const showAvatar = !isOwn && !joinsNext;
+      const reactionGroups = groupReactions(msg.reactions, user.id);
+      // a view-once photo is never shown in the conversation; a sticker goes without a frame
+      const media = msg.view_once || sticker ? [] : mediaOf(msg);
+      const hasAttachments = media.length > 0;
+      const bigEmoji = !hasAttachments && !msg.reply_to && isBigEmoji(msg.content);
+      // photos, videos, GIFs, stickers and emoji-only messages go without a bubble
+      const bare = !deleted && (bigEmoji || sticker || (hasAttachments && !msg.content && !msg.reply_to));
+      // one card per message, and not on top of images or a GIF
+      const previewUrl = hasAttachments ? null : firstLink(msg.content);
+      const replyCue = (
+        <span
+          data-reply-cue
+          className={`pointer-events-none absolute top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-white opacity-0 ${
+            isOwn ? "right-full mr-3" : "left-0"
+          }`}
+        >
+          <ReplyIcon className="w-4 h-4" />
+        </span>
+      );
+
+      return (
+        <div key={msg.client_id ?? msg.id} data-message-id={msg.id}>
+          {stamp && (
+            <p className="my-4 text-center text-[11px] font-medium" style={{ color: look.muted }}>
+              {formatStamp(msg.sent_at)}
+            </p>
+          )}
+
+          <div className={`relative ${joinsPrev ? "mt-0.5" : stamp ? "" : "mt-2.5"}`}>
+            {/* slides in when the list is swiped left */}
+            <span
+              className="absolute top-1/2 -right-[68px] w-12 -translate-y-1/2 text-[10px] tabular-nums"
+              style={{ color: look.muted }}
+            >
+              {formatTime(msg.sent_at)}
+            </span>
+            {/* fades in while the message is swiped right */}
+            {!isOwn && replyCue}
+
+            <div data-shift className={`group flex items-end ${isOwn ? "justify-end" : "justify-start"}`}>
+              {!isOwn && !isDrawing && (
+                <div className="w-7 mr-2 flex-shrink-0">
+                  {showAvatar && <Avatar user={senderOf(msg)} size={28} />}
+                </div>
+              )}
+              <div
+                className={`relative min-w-0 flex flex-col ${isDrawing ? "w-full" : "max-w-[75%]"} ${
+                  isOwn ? "items-end" : "items-start"
+                }`}
+              >
+                {showSender && (
+                  <span className={`text-[11px] font-medium mb-0.5 mx-3 ${nameColor(msg.sender_id, look.onLight)}`}>
+                    {msg.sender_pseudo}
+                  </span>
+                )}
+                <div className={`relative ${isDrawing ? "w-full" : ""}`}>
+                  {isOwn && replyCue}
+                  <div
+                    data-bubble={confirmed && !deleted ? "" : undefined}
+                    style={
+                      deleted
+                        ? { border: `1px solid ${look.muted}`, color: look.muted }
+                        : bare
+                          ? undefined
+                          : isOwn
+                            ? look.ownBubble
+                            : look.otherBubble
+                    }
+                    className={`text-[15px] sm:text-sm leading-snug wrap-anywhere select-none transition-shadow duration-300 ${bubbleCorners(
+                      isOwn,
+                      joinsPrev,
+                      joinsNext
+                    )} ${
+                      bare ? (isDrawing ? "w-full" : bigEmoji || sticker ? "" : "overflow-hidden") : hasAttachments ? "p-1" : "px-3.5 py-2"
+                    } ${
+                      msg.status === "pending" ? "opacity-70" : ""
+                    } ${msg.status === "failed" ? "opacity-60" : ""} ${highlightId === msg.id ? "ring-2 ring-amber-300" : ""}`}
+                  >
+                    {msg.reply_to && (
+                      <button
+                        type="button"
+                        onClick={() => actions.current?.jumpToMessage(msg.reply_to!.id)}
+                        title="Go to the original message"
+                        className={`block w-full rounded-xl border-l-2 border-current bg-black/15 px-2.5 py-1.5 text-left ${
+                          hasAttachments ? "mb-1" : "mb-1.5"
+                        }`}
+                      >
+                        <span className="block truncate text-[11px] font-semibold opacity-90">
+                          {msg.reply_to.sender_id === user.id ? "You" : msg.reply_to.sender_pseudo}
+                        </span>
+                        <span className="break-words text-xs opacity-75 line-clamp-2">{replySnippet(msg.reply_to)}</span>
+                      </button>
+                    )}
+                    {deleted && (
+                      <p className="flex items-center gap-1.5 italic">
+                        <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                          <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                          <path strokeLinecap="round" strokeWidth={2} d="M5.6 5.6l12.8 12.8" />
+                        </svg>
+                        {isOwn ? "You deleted this message" : "This message was deleted"}
+                      </p>
+                    )}
+                    {msg.sticker && isDrawing && (
+                      // at the size it was drawn at, shrunk to fit narrower screens
+                      // eslint-disable-next-line @next/next/no-img-element -- drawing (authenticated, same-origin)
+                      <img
+                        src={stickerImageUrl(msg.sticker.id)}
+                        alt="Drawing"
+                        draggable={false}
+                        style={{
+                          width: "100%",
+                          maxWidth: msg.sticker.width,
+                          aspectRatio: `${msg.sticker.width} / ${msg.sticker.height}`,
+                        }}
+                        className={`pointer-events-none block [-webkit-touch-callout:none] ${isOwn ? "ml-auto" : ""}`}
+                      />
+                    )}
+                    {msg.sticker && !isDrawing && (() => {
+                      const scale = Math.min(1, 150 / Math.max(msg.sticker.width, msg.sticker.height));
+                      return (
+                        // eslint-disable-next-line @next/next/no-img-element -- custom sticker (authenticated, same-origin)
+                        <img
+                          src={stickerImageUrl(msg.sticker.id)}
+                          alt="Sticker"
+                          width={Math.round(msg.sticker.width * scale)}
+                          height={Math.round(msg.sticker.height * scale)}
+                          draggable={false}
+                          className="pointer-events-none [-webkit-touch-callout:none]"
+                        />
+                      );
+                    })()}
+                    {msg.gif?.sticker && (() => {
+                      const scale = Math.min(1, 150 / Math.max(msg.gif.width, msg.gif.height));
+                      return (
+                        // eslint-disable-next-line @next/next/no-img-element -- animated sticker from GIPHY's CDN
+                        <img
+                          src={msg.gif.url}
+                          alt="Sticker"
+                          width={Math.round(msg.gif.width * scale)}
+                          height={Math.round(msg.gif.height * scale)}
+                          referrerPolicy="no-referrer"
+                          draggable={false}
+                          className="pointer-events-none [-webkit-touch-callout:none]"
+                        />
+                      );
+                    })()}
+                    {msg.view_once && (
+                      <ViewOnceBubble
+                        kind={msg.attachments[0] && isVideo(msg.attachments[0]) ? "Video" : "Photo"}
+                        state={viewOnceState(msg, isOwn, user.id)}
+                        onOpen={() => actions.current?.openOnce(msg)}
+                      />
+                    )}
+                    {hasAttachments && <AttachmentGrid attachments={media} onOpen={(i) => actions.current?.openLightbox(msg, i)} />}
+                    {bigEmoji ? (
+                      <p className="text-[44px] leading-tight">{msg.content}</p>
+                    ) : (
+                      msg.content && (
+                        <MessageText text={msg.content} className={hasAttachments ? "px-2.5 pt-1.5 pb-1" : ""} />
+                      )
+                    )}
+                    {previewUrl && <LinkPreviewCard url={previewUrl} onShown={() => actions.current?.repinToBottom()} />}
+                  </div>
+
+                  {burst?.id === msg.id && (
+                    <span
+                      key={burst.key}
+                      className="pointer-events-none absolute inset-0 flex items-center justify-center text-5xl drop-shadow-lg [animation:heart-burst_850ms_both]"
+                      onAnimationEnd={() => actions.current?.setBurst(null)}
+                    >
+                      ❤️
+                    </span>
+                  )}
+
+                  {confirmed && !deleted && (
+                    <div
+                      className={`hidden pointer-fine:flex absolute items-center gap-0.5 transition focus-within:opacity-100 ${
+                        isDrawing
+                          ? `top-1 z-10 rounded-full bg-neutral-900/90 px-1 py-0.5 ${isOwn ? "right-1 flex-row-reverse" : "left-1"}`
+                          : `top-1/2 -translate-y-1/2 ${isOwn ? "right-full mr-1.5 flex-row-reverse" : "left-full ml-1.5"}`
+                      } ${picker?.id === msg.id ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
+                    >
+                      <button
+                        type="button"
+                        data-reaction-picker
+                        onClick={(e) => actions.current?.togglePicker(msg.id, e.currentTarget)}
+                        title="Add reaction (or double-click the message for ❤️)"
+                        aria-label="Add reaction"
+                        className={`w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition ${
+                          picker?.id === msg.id ? "text-neutral-200 bg-neutral-800" : ""
+                        }`}
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                          <path strokeLinecap="round" strokeWidth={2} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => actions.current?.startReply(msg)}
+                        title="Reply"
+                        aria-label="Reply"
+                        className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                      >
+                        <ReplyIcon className="w-4 h-4" />
+                      </button>
+                      {isOwn && !msg.view_once && !sticker && (
+                        <button
+                          type="button"
+                          onClick={() => actions.current?.startEdit(msg)}
+                          title="Edit"
+                          aria-label="Edit"
+                          className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
+                        >
+                          <EditIcon className="w-4 h-4" />
+                        </button>
+                      )}
+                      {isOwn && (
+                        <button
+                          type="button"
+                          onClick={() => actions.current?.setDeleteFor(msg)}
+                          title="Delete"
+                          aria-label="Delete"
+                          className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-red-400 hover:bg-neutral-800 transition"
+                        >
+                          <TrashIcon className="w-4 h-4" />
+                        </button>
+                      )}
+                      <span className="whitespace-nowrap px-1 text-[11px] tabular-nums" style={{ color: look.muted }}>
+                        {formatTime(msg.sent_at)}
+                      </span>
+                    </div>
+                  )}
+
+                  {picker?.id === msg.id && (
+                    <div
+                      data-reaction-picker
+                      className={`absolute z-30 ${picker.below ? "top-full mt-1.5" : "bottom-full mb-1.5"} ${
+                        isOwn ? "right-0" : "left-0"
+                      }`}
+                    >
+                      <ReactionBar
+                        selected={msg.reactions.find((r) => r.user_id === user.id)?.emoji}
+                        onPick={(emoji) => actions.current?.handleReact(msg.id, emoji)}
+                        onMore={() => {
+                          actions.current?.setPicker(null);
+                          actions.current?.setReactionPickerFor(msg.id);
+                        }}
+                        compact
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {reactionGroups.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => actions.current?.setReactionsFor(msg.id)}
+                    title={reactionGroups
+                      .map((g) => `${g.emoji} ${g.userIds.map((id) => (id === user.id ? "You" : memberById.get(id)?.pseudo ?? "Former member")).join(", ")}`)
+                      .join("   ")}
+                    aria-label={`${msg.reactions.length} reaction${msg.reactions.length > 1 ? "s" : ""}, see who reacted`}
+                    className={`relative z-10 -mt-2 flex h-[22px] items-center gap-0.5 rounded-full border-2 border-neutral-950 bg-neutral-800 px-1.5 text-[13px] leading-none shadow-sm transition active:scale-95 ${
+                      isOwn ? "mr-2" : "ml-2"
+                    }`}
+                  >
+                    {reactionGroups.slice(0, 3).map((g) => (
+                      <span key={g.emoji}>{g.emoji}</span>
+                    ))}
+                    {msg.reactions.length > 1 && (
+                      <span className="ml-0.5 text-[11px] text-neutral-300 tabular-nums">{msg.reactions.length}</span>
+                    )}
+                  </button>
+                )}
+
+                {msg.edited_at && (
+                  <button
+                    type="button"
+                    onClick={() => actions.current?.openHistory(msg)}
+                    title="See edit history"
+                    className="mx-3 mt-0.5 text-[11px] hover:underline"
+                    style={{ color: look.muted }}
+                  >
+                    Edited
+                  </button>
+                )}
+
+                {isOwn && msg.view_once && confirmed && (
+                  <button
+                    type="button"
+                    onClick={() => (msg.opens ?? []).some((o) => o.user_id !== user.id) && actions.current?.setOpenersFor(msg.id)}
+                    className="mx-3 mt-0.5 text-[11px]"
+                    style={{ color: look.muted }}
+                  >
+                    {openersLabel(msg)}
+                  </button>
+                )}
+
+                {msg.status === "failed" && (
+                  <button
+                    onClick={() => actions.current?.handleRetry(msg)}
+                    className="mx-3 mt-1 text-[11px] text-red-400 hover:text-red-300 transition"
+                  >
+                    Not sent · tap to retry
+                  </button>
+                )}
+
+                {msg === lastOwnSent && !msg.view_once && lastOwnSeenBy.length > 0 && (
+                  <span className="mx-3 mt-1 text-[11px]" style={{ color: look.muted }}>
+                    {otherMembers.length === 1
+                      ? "Seen"
+                      : lastOwnSeenBy.length === otherMembers.length
+                        ? "Seen by everyone"
+                        : `Seen by ${lastOwnSeenBy.map((m) => m.pseudo).join(", ")}`}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    })}
+
+    {typingEntries.length > 0 && connState === "open" && (
+      <div className="flex items-end mt-2.5">
+        <div className="w-7 mr-2 flex-shrink-0">
+          <Avatar user={senderOf({ sender_id: typingEntries[0][0], sender_pseudo: typingEntries[0][1] })} size={28} />
+        </div>
+        <div className="flex flex-col items-start">
+          {otherMembers.length > 1 && (
+            <span className="text-[11px] font-medium mb-0.5 mx-3">
+              {typingEntries.map(([id, pseudo], i) => (
+                <Fragment key={id}>
+                  {i > 0 && <span style={{ color: look.muted }}>, </span>}
+                  <span className={nameColor(id, look.onLight)}>{pseudo}</span>
+                </Fragment>
+              ))}
+            </span>
+          )}
+          <div className="rounded-[20px] px-4 py-3 flex items-center gap-1" style={look.otherBubble}>
+            <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:0ms]" />
+            <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:150ms]" />
+            <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50 animate-bounce [animation-delay:300ms]" />
+          </div>
+        </div>
+      </div>
+    )}
+  </div>
+  );
+});

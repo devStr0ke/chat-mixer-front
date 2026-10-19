@@ -161,8 +161,10 @@ export interface LastMessage {
   /** how many of the attachments are videos */
   video_count: number;
   has_gif: boolean;
-  /** the GIF is a GIPHY sticker */
+  /** the GIF is a GIPHY sticker, or it's a custom sticker */
   sticker: boolean;
+  /** a drawing made in the chat */
+  drawing: boolean;
   view_once: boolean;
   /** deleted by its sender */
   deleted: boolean;
@@ -238,11 +240,13 @@ export interface GifPage {
 
 export type GifKind = "gifs" | "stickers";
 
-/** A sticker someone made from a photo in the app's sticker maker. */
+/** A sticker someone made from a photo in the app's sticker maker, or a drawing. */
 export interface MessageSticker {
   id: string;
   width: number;
   height: number;
+  /** "drawing": drawn in the chat (not part of anyone's sticker collection) */
+  kind?: "drawing";
 }
 
 /** Your own stickers, newest first. */
@@ -250,10 +254,19 @@ export function listMyStickers() {
   return apiFetch<MessageSticker[]>("/stickers");
 }
 
-export function createSticker(image: Blob) {
+/** `display` (drawings): the size it was drawn at on screen, which is the size it's shown at. */
+export function createSticker(
+  image: Blob,
+  kind: "sticker" | "drawing" = "sticker",
+  display?: { width: number; height: number }
+) {
   const form = new FormData();
   form.append("file", image, image.type === "image/webp" ? "sticker.webp" : "sticker.png");
-  return apiFetch<MessageSticker>("/stickers", { method: "POST", body: form });
+  if (display) {
+    form.append("display_width", String(Math.round(display.width)));
+    form.append("display_height", String(Math.round(display.height)));
+  }
+  return apiFetch<MessageSticker>(`/stickers?kind=${kind}`, { method: "POST", body: form });
 }
 
 /** Removes a sticker from your collection (messages already sent keep it). */
@@ -342,6 +355,7 @@ export interface ReplyPreview {
   video_count: number;
   has_gif: boolean;
   sticker: boolean;
+  drawing: boolean;
   view_once: boolean;
   /** the quoted message was deleted by its sender */
   deleted: boolean;

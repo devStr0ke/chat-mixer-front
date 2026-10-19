@@ -7,11 +7,13 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Create rooms and invite people with a pseudo search
 - Accept or decline invitations, delivered live
 - Real-time messaging over WebSocket (JSON protocol) with paginated history
+- Multi-line messages: on a computer Enter sends and Shift+Enter starts a new line; on a phone the return key starts a new line and the Send button sends. The box grows up to about five lines. On phones there's no emoji button (the keyboard has emojis) and the other buttons step aside while you type; while typing, the camera button becomes a search that opens stickers matching the text (picking one sends it and clears the text)
 - Send photos, videos and GIFs: button, paste or drag-and-drop. Photos are resized to 2048px and stripped of EXIF (GPS) in the browser; GIFs stay animated
 - Videos (MP4, MOV, WebM, up to 100 MB) upload with a progress indicator and can be cancelled; the browser grabs a poster frame and the duration, and they play in a full-screen player
 - Typing indicators showing who is typing, and "seen by" read receipts
 - Emoji picker (native emojis, with search, recently used and skin tones) in the message box
 - GIFs and stickers: one button opens GIPHY search with GIFs and Stickers tabs; stickers show without a bubble (requires `GIPHY_API_KEY` on the backend)
+- Draw: the pen button opens a drawing layer over the conversation (pen, neon, eraser, colors, sizes, undo); the drawing is sent with a transparent background and shown across the conversation where it was drawn (scaled down on narrower screens)
 - Make your own stickers: in the Stickers tab, "Create" opens a photo; move and zoom it, cut it out as a circle, a rounded square or freehand (draw around what to keep), with an optional white border. Saved stickers stay in "My stickers" (Edit to remove them)
 - Delete your own messages for everyone (long-press menu or the hover trash button): the room sees "This message was deleted"
 - Links are clickable and shown in a short form, with a preview card (site, title, description, image) when the page provides one

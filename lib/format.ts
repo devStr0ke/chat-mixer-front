@@ -1,11 +1,23 @@
 const DAY_MS = 86_400_000;
 
+// Intl formatters are slow to create and are used for every message: make each once.
+const formatters = new Map<string, Intl.DateTimeFormat>();
+function formatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const key = JSON.stringify(options);
+  let f = formatters.get(key);
+  if (!f) {
+    f = new Intl.DateTimeFormat([], options);
+    formatters.set(key, f);
+  }
+  return f;
+}
+
 function startOfDay(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
 }
 
 export function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return formatter({ hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
 }
 
 /** "Today", "Yesterday", or a date — used for day separators in a conversation. */
@@ -14,12 +26,12 @@ export function formatDay(iso: string): string {
   const diff = Math.round((startOfDay(new Date()) - startOfDay(d)) / DAY_MS);
   if (diff === 0) return "Today";
   if (diff === 1) return "Yesterday";
-  return d.toLocaleDateString([], {
+  return formatter({
     weekday: diff < 7 ? "long" : undefined,
     day: "numeric",
     month: "long",
     year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
-  });
+  }).format(d);
 }
 
 /** Compact timestamp for room lists: time today, weekday this week, date otherwise. */
@@ -28,8 +40,8 @@ export function formatShort(iso: string): string {
   const diff = Math.round((startOfDay(new Date()) - startOfDay(d)) / DAY_MS);
   if (diff === 0) return formatTime(iso);
   if (diff === 1) return "Yesterday";
-  if (diff < 7) return d.toLocaleDateString([], { weekday: "short" });
-  return d.toLocaleDateString([], { day: "numeric", month: "short" });
+  if (diff < 7) return formatter({ weekday: "short" }).format(d);
+  return formatter({ day: "numeric", month: "short" }).format(d);
 }
 
 /**
@@ -42,12 +54,12 @@ export function formatStamp(iso: string): string {
   const time = formatTime(iso);
   if (diff === 0) return time;
   if (diff === 1) return `Yesterday ${time}`;
-  if (diff < 7) return `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
-  const date = d.toLocaleDateString([], {
+  if (diff < 7) return `${formatter({ weekday: "short" }).format(d)} ${time}`;
+  const date = formatter({
     day: "numeric",
     month: "short",
     year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
-  });
+  }).format(d);
   return `${date}, ${time}`;
 }
 
@@ -58,10 +70,13 @@ export function formatFull(iso: string): string {
 
 const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Regional_Indicator}|[#*0-9]\uFE0F?\u20E3|\u200D|\uFE0F|\s)+$/u;
 
+let segmenter: Intl.Segmenter | null = null;
+
 /** True for messages of just one to three emojis, shown large without a bubble. */
 export function isBigEmoji(text: string): boolean {
   if (!text || text.length > 48 || !EMOJI_ONLY.test(text)) return false;
-  const graphemes = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text.replace(/\s/g, ""))];
+  segmenter ??= new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  const graphemes = [...segmenter.segment(text.replace(/\s/g, ""))];
   return graphemes.length >= 1 && graphemes.length <= 3;
 }
 

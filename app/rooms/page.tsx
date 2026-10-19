@@ -67,18 +67,31 @@ export default function RoomsPage() {
 
     let alive = true;
     let retries = 0;
-    const MAX_RETRIES = 5;
+    let everOpened = false;
+    let hiddenAt = 0;
 
     function connect() {
       if (!alive) return;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       const ws = createNotificationWebSocket();
       notifWsRef.current = ws;
 
       ws.onopen = () => {
+        if (notifWsRef.current !== ws) return;
         retries = 0;
+        // Anything that happened while we were offline never reached us.
+        if (everOpened) {
+          fetchRooms();
+          fetchInvitations();
+        }
+        everOpened = true;
       };
 
       ws.onmessage = (event) => {
+        if (notifWsRef.current !== ws) return;
         try {
           const msg: WsNotification = JSON.parse(event.data);
           switch (msg.type) {
@@ -113,6 +126,7 @@ export default function RoomsPage() {
                     video_count: msg.attachments?.filter(isVideo).length ?? 0,
                     has_gif: !!msg.gif,
                     sticker: !!msg.gif?.sticker || !!msg.sticker,
+                    drawing: msg.sticker?.kind === "drawing",
                     view_once: !!msg.view_once,
                     deleted: false,
                     sent_at: msg.sent_at,
@@ -153,20 +167,48 @@ export default function RoomsPage() {
         } catch { /* ignore malformed frames */ }
       };
 
-      ws.onclose = (e) => {
-        if (!alive) return;
-        if (e.code === 1000) return;
-        if (retries >= MAX_RETRIES) return;
+      ws.onclose = () => {
+        if (!alive || notifWsRef.current !== ws) return;
+        notifWsRef.current = null;
+        // Never give up: back off up to 30 s, and resume() below reconnects
+        // right away when the tab comes back or the network returns.
+        const delay = Math.min(30_000, 1000 * 2 ** Math.min(retries, 5));
         retries++;
-        reconnectTimerRef.current = setTimeout(connect, 3000 * retries);
+        reconnectTimerRef.current = setTimeout(connect, delay);
       };
     }
 
+    // Phones freeze background tabs and their sockets often die silently, so
+    // a socket that sat hidden for a while is replaced instead of trusted.
+    function resume() {
+      if (!alive) return;
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+        return;
+      }
+      const ws = notifWsRef.current;
+      const wasHiddenLong = hiddenAt > 0 && Date.now() - hiddenAt > 15_000;
+      hiddenAt = 0;
+      if (!ws) {
+        retries = 0;
+        connect();
+      } else if (wasHiddenLong && ws.readyState === WebSocket.OPEN) {
+        ws.onclose = null;
+        ws.close();
+        notifWsRef.current = null;
+        connect();
+      }
+    }
+
     const initTimer = setTimeout(connect, 100);
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("online", resume);
 
     return () => {
       alive = false;
       clearTimeout(initTimer);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("online", resume);
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -217,7 +259,7 @@ export default function RoomsPage() {
     }
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
     if (last.deleted) return last.sender_id === user?.id ? "You deleted a message" : `${who} deleted a message`;
-    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once, last.sticker)}`;
+    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once, last.sticker, last.drawing)}`;
   }
 
   return (

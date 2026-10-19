@@ -25,6 +25,8 @@ export function GifPicker({
   onCreateSticker,
   stickersVersion = 0,
   autoFocusSearch = false,
+  initialKind = "gifs",
+  initialQuery = "",
 }: {
   onSelect: (gif: Gif) => void;
   onSelectSticker: (sticker: MessageSticker) => void;
@@ -33,11 +35,14 @@ export function GifPicker({
   /** bumped when a sticker was added, to reload "My stickers" */
   stickersVersion?: number;
   autoFocusSearch?: boolean;
+  /** the tab and search to open on (the composer's search button) */
+  initialKind?: GifKind;
+  initialQuery?: string;
 }) {
-  const [kind, setKind] = useState<GifKind>("gifs");
+  const [kind, setKind] = useState<GifKind>(initialKind);
   const [mine, setMine] = useState<MessageSticker[] | null>(null);
   const [editingMine, setEditingMine] = useState(false);
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialQuery);
   const [gifs, setGifs] = useState<Gif[]>([]);
   const [nextOffset, setNextOffset] = useState<number | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
