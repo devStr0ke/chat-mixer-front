@@ -161,7 +161,11 @@ export interface LastMessage {
   /** how many of the attachments are videos */
   video_count: number;
   has_gif: boolean;
+  /** the GIF is a GIPHY sticker */
+  sticker: boolean;
   view_once: boolean;
+  /** deleted by its sender */
+  deleted: boolean;
   sent_at: string;
 }
 
@@ -209,12 +213,14 @@ export interface Attachment {
   has_poster?: boolean;
 }
 
-/** A GIF from the GIF library, as attached to a message. */
+/** A GIF (or sticker) from the GIF library, as attached to a message. */
 export interface MessageGif {
   id: string;
   url: string;
   width: number;
   height: number;
+  /** a transparent GIPHY sticker, shown without a bubble */
+  sticker?: boolean;
 }
 
 /** A GIF search result: the message rendition plus a smaller one for the picker grid. */
@@ -230,12 +236,42 @@ export interface GifPage {
   next_offset: number | null;
 }
 
-export function searchGifs(q: string, offset = 0) {
-  return apiFetch<GifPage>(`/gifs/search?q=${encodeURIComponent(q)}&offset=${offset}`);
+export type GifKind = "gifs" | "stickers";
+
+/** A sticker someone made from a photo in the app's sticker maker. */
+export interface MessageSticker {
+  id: string;
+  width: number;
+  height: number;
 }
 
-export function trendingGifs(offset = 0) {
-  return apiFetch<GifPage>(`/gifs/trending?offset=${offset}`);
+/** Your own stickers, newest first. */
+export function listMyStickers() {
+  return apiFetch<MessageSticker[]>("/stickers");
+}
+
+export function createSticker(image: Blob) {
+  const form = new FormData();
+  form.append("file", image, image.type === "image/webp" ? "sticker.webp" : "sticker.png");
+  return apiFetch<MessageSticker>("/stickers", { method: "POST", body: form });
+}
+
+/** Removes a sticker from your collection (messages already sent keep it). */
+export function deleteSticker(id: string) {
+  return apiFetch<Record<string, never>>(`/stickers/${id}`, { method: "DELETE" });
+}
+
+/** Same-origin, so the auth cookie goes along with <img> requests. */
+export function stickerImageUrl(id: string) {
+  return `${HTTP_BASE}/stickers/${id}/image`;
+}
+
+export function searchGifs(q: string, offset = 0, kind: GifKind = "gifs") {
+  return apiFetch<GifPage>(`/gifs/search?q=${encodeURIComponent(q)}&offset=${offset}&kind=${kind}`);
+}
+
+export function trendingGifs(offset = 0, kind: GifKind = "gifs") {
+  return apiFetch<GifPage>(`/gifs/trending?offset=${offset}&kind=${kind}`);
 }
 
 export interface Message {
@@ -256,11 +292,20 @@ export interface Message {
   opens?: MessageOpen[];
   /** view-once: the file is gone (everyone opened it, or 14 days passed) */
   expired?: boolean;
+  /** deleted by its sender: everything else is empty */
+  deleted?: boolean;
+  /** a custom sticker (made in the app) */
+  sticker?: MessageSticker;
 }
 
 export interface MessageOpen {
   user_id: string;
   opened_at: string;
+}
+
+/** Deletes your own message for everyone; it then shows as "This message was deleted". */
+export function deleteMessage(messageId: string) {
+  return apiFetch<Record<string, never>>(`/messages/${messageId}`, { method: "DELETE" });
 }
 
 /** Opens a view-once message (once). The file can then be fetched for `expires_in` seconds. */
@@ -296,7 +341,10 @@ export interface ReplyPreview {
   /** how many of the attachments are videos */
   video_count: number;
   has_gif: boolean;
+  sticker: boolean;
   view_once: boolean;
+  /** the quoted message was deleted by its sender */
+  deleted: boolean;
 }
 
 export interface MessagePage {
@@ -540,6 +588,7 @@ export type WsOutgoing =
       gif_id?: string;
       reply_to_id?: string;
       view_once?: boolean;
+      sticker_id?: string;
     }
   | { type: "typing" }
   | { type: "read"; id: string };
@@ -557,9 +606,11 @@ export type WsIncoming =
       gif?: MessageGif;
       reply_to?: ReplyPreview;
       view_once?: boolean;
+      sticker?: MessageSticker;
     }
   | { type: "message_edited"; id: string; room_id: string; content: string; edited_at: string }
   | { type: "message_opened"; id: string; user_id: string; opened_at: string }
+  | { type: "message_deleted"; id: string; room_id: string }
   | { type: "message_ack"; id: string; client_id: string; sent_at: string }
   | { type: "message_error"; client_id: string }
   | { type: "typing"; user_id: string; pseudo: string }
@@ -583,8 +634,10 @@ export type WsNotification =
       gif?: MessageGif;
       reply_to?: ReplyPreview;
       view_once?: boolean;
+      sticker?: MessageSticker;
     }
   | { type: "message_edited"; id: string; room_id: string; content: string; edited_at: string }
+  | { type: "message_deleted"; id: string; room_id: string }
   | { type: "invitation"; room_id: string }
   | { type: "room_removed"; room_id: string }
   | { type: "room_read"; room_id: string }

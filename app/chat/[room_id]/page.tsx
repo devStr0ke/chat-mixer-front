@@ -14,6 +14,9 @@ import {
   removeReaction,
   editMessage,
   openViewOnce,
+  deleteMessage,
+  createSticker,
+  stickerImageUrl,
   ACCEPTED_IMAGE_TYPES,
   ACCEPTED_VIDEO_TYPES,
   type RoomDetail,
@@ -23,6 +26,7 @@ import {
   type Gif,
   type MessageGif,
   type ReplyPreview,
+  type MessageSticker,
   type WsOutgoing,
   type WsIncoming,
 } from "@/lib/api";
@@ -46,6 +50,8 @@ import { MessageMenu, type MessageAction } from "@/components/MessageMenu";
 import { ReactionsSheet } from "@/components/ReactionsSheet";
 import { ViewOnceBubble, ViewOnceIcon, ViewOnceViewer, OpenersSheet, type ViewOnceState } from "@/components/ViewOnce";
 import { Camera } from "@/components/Camera";
+import { Sheet } from "@/components/Sheet";
+import { StickerMaker } from "@/components/StickerMaker";
 import { resolveTheme } from "@/lib/theme";
 
 // loaded on first use: most visits never open the picker
@@ -92,13 +98,16 @@ function replyPreviewOf(msg: ChatMessage): ReplyPreview {
     attachment_count: msg.attachments.length,
     video_count: msg.attachments.filter(isVideo).length,
     has_gif: !!msg.gif,
+    sticker: !!msg.gif?.sticker || !!msg.sticker,
     view_once: !!msg.view_once,
+    deleted: !!msg.deleted,
   };
 }
 
 /** One-line description of a quoted message. */
 function replySnippet(reply: ReplyPreview): string {
-  return reply.content || mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once);
+  if (reply.deleted) return "Deleted message";
+  return reply.content || mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once, reply.sticker);
 }
 
 /** What a message shows as media: its GIF, or its uploaded photos and videos. */
@@ -180,6 +189,12 @@ export default function ChatPage() {
   // composer: send the picked photos/videos as view-once
   const [viewOnce, setViewOnce] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
+  // own message waiting for "delete for everyone" to be confirmed
+  const [deleteFor, setDeleteFor] = useState<ChatMessage | null>(null);
+  // photo being turned into a sticker
+  const [stickerSource, setStickerSource] = useState<File | null>(null);
+  // bumped when a sticker is created, so the picker reloads "My stickers"
+  const [stickersVersion, setStickersVersion] = useState(0);
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
   const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
@@ -209,6 +224,7 @@ export default function ChatPage() {
   const revealRef = useRef<HTMLDivElement>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const stickerFileRef = useRef<HTMLInputElement>(null);
   // last caret position in the message box, so emojis land where the user was typing
   const caretRef = useRef<{ start: number; end: number } | null>(null);
   // message to scroll to once the older pages containing it have rendered
@@ -232,6 +248,8 @@ export default function ChatPage() {
   const closeViewer = useCallback(() => setViewing(null), []);
   const closeOpeners = useCallback(() => setOpenersFor(null), []);
   const closeCamera = useCallback(() => setCameraOpen(false), []);
+  const closeDelete = useCallback(() => setDeleteFor(null), []);
+  const closeStickerMaker = useCallback(() => setStickerSource(null), []);
   const gestures = useMessageGestures(scrollRef, revealRef, {
     onLongPress: (id, bubble) => {
       const msg = messagesRef.current.find((m) => m.id === id);
@@ -406,6 +424,7 @@ export default function ChatPage() {
               reply_to: incoming.reply_to ?? null,
               edited_at: null,
               view_once: incoming.view_once,
+              sticker: incoming.sticker,
             };
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
@@ -457,6 +476,10 @@ export default function ChatPage() {
 
           case "message_opened":
             addOpen(incoming.id, incoming.user_id, incoming.opened_at);
+            break;
+
+          case "message_deleted":
+            markDeleted(incoming.id);
             break;
 
           case "reaction":
@@ -655,7 +678,8 @@ export default function ChatPage() {
     attachments: DisplayAttachment[] = [],
     gif: MessageGif | null = null,
     reply: ReplyPreview | null = null,
-    viewOnce = false
+    viewOnce = false,
+    sticker: MessageSticker | null = null
   ) {
     if (!user) return;
     localIdRef.current += 1;
@@ -668,6 +692,7 @@ export default function ChatPage() {
       ...(gif && { gif_id: gif.id }),
       ...(reply && { reply_to_id: reply.id }),
       ...(viewOnce && { view_once: true }),
+      ...(sticker && { sticker_id: sticker.id }),
     });
     const localMsg: ChatMessage = {
       id: clientId,
@@ -683,6 +708,7 @@ export default function ChatPage() {
       reply_to: reply,
       edited_at: null,
       ...(viewOnce && { view_once: true }),
+      ...(sticker && { sticker }),
     };
     scrollModeRef.current = "bottom";
     setMessages((prev) => [...prev, localMsg]);
@@ -717,7 +743,7 @@ export default function ChatPage() {
   function handleRetry(msg: ChatMessage) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-    sendContent(msg.content, msg.attachments, msg.gif, msg.reply_to, !!msg.view_once);
+    sendContent(msg.content, msg.attachments, msg.gif, msg.reply_to, !!msg.view_once, msg.sticker ?? null);
   }
 
   /** The quote for the message being composed; sending it ends the reply. */
@@ -819,8 +845,21 @@ export default function ChatPage() {
   // picking a GIF sends it straight away, like other chat apps
   function sendGif(gif: Gif) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-    sendContent("", [], { id: gif.id, url: gif.url, width: gif.width, height: gif.height }, takeReply());
+    sendContent("", [], { id: gif.id, url: gif.url, width: gif.width, height: gif.height, sticker: gif.sticker }, takeReply());
     setPanel(null);
+  }
+
+  function sendSticker(sticker: MessageSticker) {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    sendContent("", [], null, takeReply(), false, sticker);
+    setPanel(null);
+  }
+
+  async function saveSticker(image: Blob) {
+    await createSticker(image);
+    setStickerSource(null);
+    setStickersVersion((v) => v + 1);
+    showToast("Sticker saved");
   }
 
   function mediaFiles(list: FileList | null | undefined): File[] {
@@ -947,6 +986,36 @@ export default function ChatPage() {
   function pickFromLibrary() {
     setCameraOpen(false);
     fileInputRef.current?.click();
+  }
+
+  /** Empties a deleted message (and quotes of it), and closes anything open on it. */
+  function markDeleted(id: string) {
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id === id) {
+          return { ...m, deleted: true, content: "", attachments: [], gif: null, sticker: undefined, reactions: [], reply_to: null, edited_at: null, view_once: false, opens: undefined };
+        }
+        if (m.reply_to?.id === id) {
+          return { ...m, reply_to: { ...m.reply_to, content: "", deleted: true, attachment_count: 0, video_count: 0, has_gif: false } };
+        }
+        return m;
+      })
+    );
+    setReplyTo((r) => (r?.id === id ? null : r));
+    setEditing((e) => (e?.id === id ? null : e));
+    setMenu((x) => (x?.msg.id === id ? null : x));
+    setReactionsFor((x) => (x === id ? null : x));
+    setViewing((v) => (v?.msg.id === id ? null : v));
+  }
+
+  async function confirmDelete(msg: ChatMessage) {
+    setDeleteFor(null);
+    try {
+      await deleteMessage(msg.id);
+      markDeleted(msg.id);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Couldn't delete the message.");
+    }
   }
 
   function addOpen(messageId: string, openerId: string, openedAt: string) {
@@ -1339,6 +1408,9 @@ export default function ChatPage() {
             const next = messages[i + 1];
             const isOwn = msg.sender_id === user.id;
             const confirmed = !msg.status;
+            const deleted = !!msg.deleted;
+            // a GIPHY sticker or one made in the app
+            const sticker = !!msg.gif?.sticker || !!msg.sticker;
             const stamp = !prev || pauseBetween(prev, msg);
             const joinsPrev = !stamp && prev.sender_id === msg.sender_id;
             const joinsNext = !!next && next.sender_id === msg.sender_id && !pauseBetween(msg, next);
@@ -1346,12 +1418,12 @@ export default function ChatPage() {
             const showSender = !isOwn && !joinsPrev && otherMembers.length > 1;
             const showAvatar = !isOwn && !joinsNext;
             const reactionGroups = groupReactions(msg.reactions, user.id);
-            // a view-once photo is never shown in the conversation
-            const media = msg.view_once ? [] : mediaOf(msg);
+            // a view-once photo is never shown in the conversation; a sticker goes without a frame
+            const media = msg.view_once || sticker ? [] : mediaOf(msg);
             const hasAttachments = media.length > 0;
             const bigEmoji = !hasAttachments && !msg.reply_to && isBigEmoji(msg.content);
-            // photos, videos, GIFs and emoji-only messages go without a bubble
-            const bare = bigEmoji || (hasAttachments && !msg.content && !msg.reply_to);
+            // photos, videos, GIFs, stickers and emoji-only messages go without a bubble
+            const bare = !deleted && (bigEmoji || sticker || (hasAttachments && !msg.content && !msg.reply_to));
             // one card per message, and not on top of images or a GIF
             const previewUrl = hasAttachments ? null : firstLink(msg.content);
             const replyCue = (
@@ -1399,13 +1471,21 @@ export default function ChatPage() {
                       <div className="relative">
                         {isOwn && replyCue}
                         <div
-                          data-bubble={confirmed ? "" : undefined}
-                          style={bare ? undefined : isOwn ? look.ownBubble : look.otherBubble}
+                          data-bubble={confirmed && !deleted ? "" : undefined}
+                          style={
+                            deleted
+                              ? { border: `1px solid ${look.muted}`, color: look.muted }
+                              : bare
+                                ? undefined
+                                : isOwn
+                                  ? look.ownBubble
+                                  : look.otherBubble
+                          }
                           className={`text-[15px] sm:text-sm leading-snug wrap-anywhere select-none transition-shadow duration-300 ${bubbleCorners(
                             isOwn,
                             joinsPrev,
                             joinsNext
-                          )} ${bare ? (bigEmoji ? "" : "overflow-hidden") : hasAttachments ? "p-1" : "px-3.5 py-2"} ${
+                          )} ${bare ? (bigEmoji || sticker ? "" : "overflow-hidden") : hasAttachments ? "p-1" : "px-3.5 py-2"} ${
                             msg.status === "pending" ? "opacity-70" : ""
                           } ${msg.status === "failed" ? "opacity-60" : ""} ${highlightId === msg.id ? "ring-2 ring-amber-300" : ""}`}
                         >
@@ -1424,6 +1504,44 @@ export default function ChatPage() {
                               <span className="break-words text-xs opacity-75 line-clamp-2">{replySnippet(msg.reply_to)}</span>
                             </button>
                           )}
+                          {deleted && (
+                            <p className="flex items-center gap-1.5 italic">
+                              <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                                <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                                <path strokeLinecap="round" strokeWidth={2} d="M5.6 5.6l12.8 12.8" />
+                              </svg>
+                              {isOwn ? "You deleted this message" : "This message was deleted"}
+                            </p>
+                          )}
+                          {msg.sticker && (() => {
+                            const scale = Math.min(1, 150 / Math.max(msg.sticker.width, msg.sticker.height));
+                            return (
+                              // eslint-disable-next-line @next/next/no-img-element -- custom sticker (authenticated, same-origin)
+                              <img
+                                src={stickerImageUrl(msg.sticker.id)}
+                                alt="Sticker"
+                                width={Math.round(msg.sticker.width * scale)}
+                                height={Math.round(msg.sticker.height * scale)}
+                                draggable={false}
+                                className="pointer-events-none [-webkit-touch-callout:none]"
+                              />
+                            );
+                          })()}
+                          {msg.gif?.sticker && (() => {
+                            const scale = Math.min(1, 150 / Math.max(msg.gif.width, msg.gif.height));
+                            return (
+                              // eslint-disable-next-line @next/next/no-img-element -- animated sticker from GIPHY's CDN
+                              <img
+                                src={msg.gif.url}
+                                alt="Sticker"
+                                width={Math.round(msg.gif.width * scale)}
+                                height={Math.round(msg.gif.height * scale)}
+                                referrerPolicy="no-referrer"
+                                draggable={false}
+                                className="pointer-events-none [-webkit-touch-callout:none]"
+                              />
+                            );
+                          })()}
                           {msg.view_once && (
                             <ViewOnceBubble
                               kind={msg.attachments[0] && isVideo(msg.attachments[0]) ? "Video" : "Photo"}
@@ -1452,7 +1570,7 @@ export default function ChatPage() {
                           </span>
                         )}
 
-                        {confirmed && (
+                        {confirmed && !deleted && (
                           <div
                             className={`hidden pointer-fine:flex absolute top-1/2 -translate-y-1/2 items-center gap-0.5 transition focus-within:opacity-100 ${
                               isOwn ? "right-full mr-1.5 flex-row-reverse" : "left-full ml-1.5"
@@ -1482,7 +1600,7 @@ export default function ChatPage() {
                             >
                               <ReplyIcon className="w-4 h-4" />
                             </button>
-                            {isOwn && !msg.view_once && (
+                            {isOwn && !msg.view_once && !sticker && (
                               <button
                                 type="button"
                                 onClick={() => startEdit(msg)}
@@ -1491,6 +1609,17 @@ export default function ChatPage() {
                                 className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition"
                               >
                                 <EditIcon className="w-4 h-4" />
+                              </button>
+                            )}
+                            {isOwn && (
+                              <button
+                                type="button"
+                                onClick={() => setDeleteFor(msg)}
+                                title="Delete"
+                                aria-label="Delete"
+                                className="w-7 h-7 flex items-center justify-center rounded-full text-neutral-500 hover:text-red-400 hover:bg-neutral-800 transition"
+                              >
+                                <TrashIcon className="w-4 h-4" />
                               </button>
                             )}
                             <span className="whitespace-nowrap px-1 text-[11px] tabular-nums" style={{ color: look.muted }}>
@@ -1635,7 +1764,13 @@ export default function ChatPage() {
               {panel === "emoji" ? (
                 <EmojiPickerPanel onSelect={insertEmoji} />
               ) : (
-                <GifPicker onSelect={sendGif} autoFocusSearch={pointerFine} />
+                <GifPicker
+                  onSelect={sendGif}
+                  onSelectSticker={sendSticker}
+                  onCreateSticker={() => stickerFileRef.current?.click()}
+                  stickersVersion={stickersVersion}
+                  autoFocusSearch={pointerFine}
+                />
               )}
             </div>
           )}
@@ -1701,6 +1836,17 @@ export default function ChatPage() {
             )}
             <div className="px-3 pt-2 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
               <input
+                ref={stickerFileRef}
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES.join(",")}
+                hidden
+                onChange={(e) => {
+                  const picked = e.target.files?.[0];
+                  if (picked) setStickerSource(picked);
+                  e.target.value = "";
+                }}
+              />
+              <input
                 ref={fileInputRef}
                 type="file"
                 accept={[...ACCEPTED_IMAGE_TYPES, ...ACCEPTED_VIDEO_TYPES].join(",")}
@@ -1743,7 +1889,7 @@ export default function ChatPage() {
                     }
                     // ↑ in an empty box edits your last message, as in most desktop chat apps
                     if (e.key === "ArrowUp" && !editing && input === "") {
-                      const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status && !m.view_once);
+                      const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status && !m.view_once && !m.deleted);
                       if (lastOwn) {
                         e.preventDefault();
                         startEdit(lastOwn);
@@ -1807,13 +1953,11 @@ export default function ChatPage() {
                     className={`flex h-9 w-10 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${
                       panel === "gif" ? "text-white" : "text-neutral-400"
                     }`}
-                    aria-label="GIF"
+                    aria-label="GIFs and stickers"
                     aria-expanded={panel === "gif"}
-                    title="Send a GIF"
+                    title="GIFs and stickers"
                   >
-                    <span className="flex h-5 items-center rounded-md border-[1.5px] border-current px-1 text-[9px] font-bold leading-none tracking-wide">
-                      GIF
-                    </span>
+                    <StickerIcon className="w-[23px] h-[23px]" />
                   </button>
                 )}
               </div>
@@ -1873,11 +2017,24 @@ export default function ChatPage() {
           ...(msg.content
             ? [{ label: "Copy", icon: <CopyIcon className="w-5 h-5" />, onSelect: () => copyText(msg.content) }]
             : []),
-          ...(isOwn && !msg.view_once
+          ...(isOwn && !msg.view_once && !msg.gif?.sticker && !msg.sticker
             ? [{ label: "Edit", icon: <EditIcon className="w-5 h-5" />, onSelect: () => startEdit(msg) }]
             : []),
           ...(msg.edited_at
             ? [{ label: "Edit history", icon: <HistoryIcon className="w-5 h-5" />, onSelect: () => openHistory(msg) }]
+            : []),
+          ...(isOwn
+            ? [
+                {
+                  label: "Delete",
+                  icon: <TrashIcon className="w-5 h-5" />,
+                  danger: true,
+                  onSelect: () => {
+                    setMenu(null);
+                    setDeleteFor(msg);
+                  },
+                },
+              ]
             : []),
         ];
         return (
@@ -1917,6 +2074,32 @@ export default function ChatPage() {
 
       {cameraOpen && <Camera onSend={sendPhoto} onPickFromLibrary={pickFromLibrary} onClose={closeCamera} />}
 
+      {stickerSource && <StickerMaker file={stickerSource} onSave={saveSticker} onClose={closeStickerMaker} />}
+
+      {deleteFor && (
+        <Sheet title="Delete this message?" onClose={closeDelete}>
+          <p className="px-6 pb-4 text-center text-sm text-neutral-400">
+            It&apos;s deleted for everyone in the room. They&apos;ll see &ldquo;This message was deleted&rdquo;.
+          </p>
+          <div className="flex flex-col gap-2 px-4">
+            <button
+              type="button"
+              onClick={() => confirmDelete(deleteFor)}
+              className="rounded-xl bg-red-600 py-3 text-[15px] font-semibold text-white transition hover:bg-red-500 active:scale-[0.98]"
+            >
+              Delete for everyone
+            </button>
+            <button
+              type="button"
+              onClick={closeDelete}
+              className="rounded-xl bg-neutral-800 py-3 text-[15px] text-neutral-200 transition hover:bg-neutral-700"
+            >
+              Cancel
+            </button>
+          </div>
+        </Sheet>
+      )}
+
       {viewing && (
         <ViewOnceViewer
           attachment={viewing.attachment}
@@ -1942,6 +2125,25 @@ export default function ChatPage() {
         </div>
       )}
     </div>
+  );
+}
+
+function TrashIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2" />
+    </svg>
+  );
+}
+
+/** Instagram's GIFs-and-stickers mark: a sticker with a peeling corner. */
+function StickerIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M20 12.5V7a3 3 0 00-3-3H7a3 3 0 00-3 3v10a3 3 0 003 3h5.5L20 12.5z" />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12.5 20v-4.5a3 3 0 013-3H20" />
+      <path strokeLinecap="round" strokeWidth={1.8} d="M8.5 14s1 1.2 2.5 1.2M9 9.5h.01M14 9.5h.01" />
+    </svg>
   );
 }
 

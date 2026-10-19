@@ -112,7 +112,9 @@ export default function RoomsPage() {
                     attachment_count: msg.attachments?.length ?? 0,
                     video_count: msg.attachments?.filter(isVideo).length ?? 0,
                     has_gif: !!msg.gif,
+                    sticker: !!msg.gif?.sticker || !!msg.sticker,
                     view_once: !!msg.view_once,
+                    deleted: false,
                     sent_at: msg.sent_at,
                   },
                 };
@@ -124,6 +126,15 @@ export default function RoomsPage() {
               setRooms((prev) =>
                 prev.map((r) =>
                   r.last_message?.id === msg.id ? { ...r, last_message: { ...r.last_message, content: msg.content } } : r
+                )
+              );
+              break;
+            case "message_deleted":
+              setRooms((prev) =>
+                prev.map((r) =>
+                  r.last_message?.id === msg.id
+                    ? { ...r, last_message: { ...r.last_message, content: "", attachment_count: 0, video_count: 0, has_gif: false, deleted: true } }
+                    : r
                 )
               );
               break;
@@ -205,7 +216,8 @@ export default function RoomsPage() {
         : `No messages yet · ${room.member_count} members`;
     }
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
-    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once)}`;
+    if (last.deleted) return last.sender_id === user?.id ? "You deleted a message" : `${who} deleted a message`;
+    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once, last.sticker)}`;
   }
 
   return (

@@ -11,7 +11,9 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Videos (MP4, MOV, WebM, up to 100 MB) upload with a progress indicator and can be cancelled; the browser grabs a poster frame and the duration, and they play in a full-screen player
 - Typing indicators showing who is typing, and "seen by" read receipts
 - Emoji picker (native emojis, with search, recently used and skin tones) in the message box
-- GIF library: search GIPHY and send with one click (requires `GIPHY_API_KEY` on the backend)
+- GIFs and stickers: one button opens GIPHY search with GIFs and Stickers tabs; stickers show without a bubble (requires `GIPHY_API_KEY` on the backend)
+- Make your own stickers: in the Stickers tab, "Create" opens a photo; move and zoom it, cut it out as a circle, a rounded square or freehand (draw around what to keep), with an optional white border. Saved stickers stay in "My stickers" (Edit to remove them)
+- Delete your own messages for everyone (long-press menu or the hover trash button): the room sees "This message was deleted"
 - Links are clickable and shown in a short form, with a preview card (site, title, description, image) when the page provides one
 - Replies: quote a message (swipe it right on mobile, hover button on desktop); tap the quote to jump to the original
 - Edit your own messages (long-press menu, hover button, or ↑ in an empty message box); an "Edited" label opens the full edit history

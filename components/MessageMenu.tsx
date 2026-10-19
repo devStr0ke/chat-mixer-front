@@ -7,6 +7,8 @@ export type MessageAction = {
   label: string;
   icon: ReactNode;
   onSelect: () => void;
+  /** destructive (shown in red) */
+  danger?: boolean;
 };
 
 const MARGIN = 12;
@@ -153,11 +155,13 @@ export function MessageMenu({
             key={a.label}
             type="button"
             onClick={a.onSelect}
-            className="flex w-full items-center justify-between border-t border-neutral-800 px-4 text-[15px] text-neutral-100 active:bg-neutral-800 hover:bg-neutral-800/70"
+            className={`flex w-full items-center justify-between border-t border-neutral-800 px-4 text-[15px] active:bg-neutral-800 hover:bg-neutral-800/70 ${
+              a.danger ? "text-red-400" : "text-neutral-100"
+            }`}
             style={{ height: ACTION_HEIGHT }}
           >
             {a.label}
-            <span className="text-neutral-300">{a.icon}</span>
+            <span className={a.danger ? "text-red-400" : "text-neutral-300"}>{a.icon}</span>
           </button>
         ))}
       </div>
