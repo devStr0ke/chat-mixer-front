@@ -13,6 +13,7 @@ import {
   addReaction,
   removeReaction,
   editMessage,
+  openViewOnce,
   ACCEPTED_IMAGE_TYPES,
   ACCEPTED_VIDEO_TYPES,
   type RoomDetail,
@@ -43,6 +44,8 @@ import { useMessageGestures } from "@/lib/useMessageGestures";
 import { ReactionBar } from "@/components/ReactionBar";
 import { MessageMenu, type MessageAction } from "@/components/MessageMenu";
 import { ReactionsSheet } from "@/components/ReactionsSheet";
+import { ViewOnceBubble, ViewOnceIcon, ViewOnceViewer, OpenersSheet, type ViewOnceState } from "@/components/ViewOnce";
+import { Camera } from "@/components/Camera";
 import { resolveTheme } from "@/lib/theme";
 
 // loaded on first use: most visits never open the picker
@@ -89,12 +92,13 @@ function replyPreviewOf(msg: ChatMessage): ReplyPreview {
     attachment_count: msg.attachments.length,
     video_count: msg.attachments.filter(isVideo).length,
     has_gif: !!msg.gif,
+    view_once: !!msg.view_once,
   };
 }
 
 /** One-line description of a quoted message. */
 function replySnippet(reply: ReplyPreview): string {
-  return reply.content || mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif);
+  return reply.content || mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once);
 }
 
 /** What a message shows as media: its GIF, or its uploaded photos and videos. */
@@ -111,6 +115,14 @@ function mediaOf(msg: ChatMessage): DisplayAttachment[] {
 function bubbleCorners(isOwn: boolean, joinsPrev: boolean, joinsNext: boolean): string {
   const [top, bottom] = isOwn ? ["rounded-tr-[6px]", "rounded-br-[6px]"] : ["rounded-tl-[6px]", "rounded-bl-[6px]"];
   return `rounded-[20px] ${joinsPrev ? top : ""} ${joinsNext ? bottom : ""}`;
+}
+
+/** How a view-once message looks to the current user. */
+function viewOnceState(msg: ChatMessage, isOwn: boolean, userId: string): ViewOnceState {
+  if (isOwn) return "sent";
+  if (msg.opens?.some((o) => o.user_id === userId)) return "opened";
+  if (msg.expired) return "expired";
+  return "ready";
 }
 
 /** Whether two consecutive messages are far enough apart for a timestamp between them. */
@@ -161,6 +173,13 @@ export default function ChatPage() {
   // double-tap ❤️ animation
   const [burst, setBurst] = useState<{ id: string; key: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // the view-once photo or video being looked at
+  const [viewing, setViewing] = useState<{ msg: ChatMessage; attachment: DisplayAttachment } | null>(null);
+  // own view-once message whose "opened by" list is shown
+  const [openersFor, setOpenersFor] = useState<string | null>(null);
+  // composer: send the picked photos/videos as view-once
+  const [viewOnce, setViewOnce] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
   // desktop reaction picker, anchored to a message; opens below when near the top of the list
   const [picker, setPicker] = useState<{ id: string; below: boolean } | null>(null);
   const [lightbox, setLightbox] = useState<{ items: DisplayAttachment[]; index: number } | null>(null);
@@ -210,6 +229,9 @@ export default function ChatPage() {
 
   const closeMenu = useCallback(() => setMenu(null), []);
   const closeReactions = useCallback(() => setReactionsFor(null), []);
+  const closeViewer = useCallback(() => setViewing(null), []);
+  const closeOpeners = useCallback(() => setOpenersFor(null), []);
+  const closeCamera = useCallback(() => setCameraOpen(false), []);
   const gestures = useMessageGestures(scrollRef, revealRef, {
     onLongPress: (id, bubble) => {
       const msg = messagesRef.current.find((m) => m.id === id);
@@ -383,6 +405,7 @@ export default function ChatPage() {
               gif: incoming.gif ?? null,
               reply_to: incoming.reply_to ?? null,
               edited_at: null,
+              view_once: incoming.view_once,
             };
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
             clearTyping(incoming.sender_id);
@@ -430,6 +453,10 @@ export default function ChatPage() {
 
           case "message_edited":
             applyEdit(incoming.id, incoming.content ?? "", incoming.edited_at);
+            break;
+
+          case "message_opened":
+            addOpen(incoming.id, incoming.user_id, incoming.opened_at);
             break;
 
           case "reaction":
@@ -627,7 +654,8 @@ export default function ChatPage() {
     text: string,
     attachments: DisplayAttachment[] = [],
     gif: MessageGif | null = null,
-    reply: ReplyPreview | null = null
+    reply: ReplyPreview | null = null,
+    viewOnce = false
   ) {
     if (!user) return;
     localIdRef.current += 1;
@@ -639,6 +667,7 @@ export default function ChatPage() {
       ...(attachments.length > 0 && { attachment_ids: attachments.map((a) => a.id) }),
       ...(gif && { gif_id: gif.id }),
       ...(reply && { reply_to_id: reply.id }),
+      ...(viewOnce && { view_once: true }),
     });
     const localMsg: ChatMessage = {
       id: clientId,
@@ -653,6 +682,7 @@ export default function ChatPage() {
       gif,
       reply_to: reply,
       edited_at: null,
+      ...(viewOnce && { view_once: true }),
     };
     scrollModeRef.current = "bottom";
     setMessages((prev) => [...prev, localMsg]);
@@ -667,7 +697,16 @@ export default function ChatPage() {
     const text = input.trim();
     if (composer.blocked || (!text && composer.ready === 0)) return;
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-    sendContent(text, composer.take(), null, takeReply());
+    const picked = composer.take();
+    if (viewOnce && picked.length > 0) {
+      // each photo or video is its own view-once message; any text follows normally
+      const reply = takeReply();
+      picked.forEach((a, i) => sendContent("", [a], null, i === 0 ? reply : null, true));
+      if (text) sendContent(text);
+      setViewOnce(false);
+    } else {
+      sendContent(text, picked, null, takeReply());
+    }
     setInput("");
     caretRef.current = null;
     setPanel(null);
@@ -678,7 +717,7 @@ export default function ChatPage() {
   function handleRetry(msg: ChatMessage) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
-    sendContent(msg.content, msg.attachments, msg.gif, msg.reply_to);
+    sendContent(msg.content, msg.attachments, msg.gif, msg.reply_to, !!msg.view_once);
   }
 
   /** The quote for the message being composed; sending it ends the reply. */
@@ -888,6 +927,58 @@ export default function ChatPage() {
     try { await addReaction(messageId, emoji); } catch { applyReactionOptimistically(messageId, existing ?? null); }
   }
 
+  /** The camera's Send: the photo goes out on its own, like a snap. */
+  async function sendPhoto(file: File, once: boolean) {
+    setCameraOpen(false);
+    if (wsRef.current?.readyState !== WebSocket.OPEN) {
+      showToast("Not connected, the photo wasn't sent.");
+      return;
+    }
+    showToast("Sending…");
+    try {
+      const attachment = await composer.uploadNow(file);
+      sendContent("", [attachment], null, takeReply(), once);
+      setToast(null);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "The photo couldn't be sent.");
+    }
+  }
+
+  function pickFromLibrary() {
+    setCameraOpen(false);
+    fileInputRef.current?.click();
+  }
+
+  function addOpen(messageId: string, openerId: string, openedAt: string) {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId && !m.opens?.some((o) => o.user_id === openerId)
+          ? { ...m, opens: [...(m.opens ?? []), { user_id: openerId, opened_at: openedAt }] }
+          : m
+      )
+    );
+  }
+
+  /** Opens a view-once photo or video: the server allows it once per person. */
+  async function openOnce(msg: ChatMessage) {
+    if (!userId || viewing) return;
+    try {
+      const { attachment } = await openViewOnce(msg.id);
+      addOpen(msg.id, userId, new Date().toISOString());
+      setViewing({ msg, attachment });
+    } catch (err) {
+      if (isStatus(err, 410)) {
+        // opened on another device, or expired meanwhile
+        if (/expired/i.test(err instanceof Error ? err.message : "")) {
+          setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, expired: true } : m)));
+        } else {
+          addOpen(msg.id, userId, new Date().toISOString());
+        }
+      }
+      showToast(err instanceof Error ? err.message : "Couldn't open it.");
+    }
+  }
+
   /** Double-tap: always a ❤️ (never takes it away), with a heart animation. */
   function likeMessage(msg: ChatMessage) {
     setBurst({ id: msg.id, key: Date.now() });
@@ -1011,6 +1102,19 @@ export default function ChatPage() {
   function seenBy(msg: ChatMessage): Member[] {
     const sent = new Date(msg.sent_at).getTime();
     return otherMembers.filter((m) => new Date(m.last_read_at).getTime() >= sent);
+  }
+
+  /** Under your own view-once message: who has opened it. */
+  function openersLabel(msg: ChatMessage): string {
+    const openers = (msg.opens ?? []).filter((o) => o.user_id !== user!.id);
+    if (openers.length === 0) return msg.expired ? "Expired" : "Not opened yet";
+    if (otherMembers.length <= 1) return "Opened";
+    if (openers.length >= otherMembers.length) return "Opened by everyone";
+    return `Opened by ${openers.map((o) => memberById.get(o.user_id)?.pseudo ?? "a former member").join(", ")}`;
+  }
+
+  function personOf(id: string) {
+    return memberById.get(id) ?? { id, pseudo: "Former member", avatar_id: null };
   }
 
   const lastOwnSent = messages.findLast((m) => m.sender_id === user.id && !m.status);
@@ -1242,7 +1346,8 @@ export default function ChatPage() {
             const showSender = !isOwn && !joinsPrev && otherMembers.length > 1;
             const showAvatar = !isOwn && !joinsNext;
             const reactionGroups = groupReactions(msg.reactions, user.id);
-            const media = mediaOf(msg);
+            // a view-once photo is never shown in the conversation
+            const media = msg.view_once ? [] : mediaOf(msg);
             const hasAttachments = media.length > 0;
             const bigEmoji = !hasAttachments && !msg.reply_to && isBigEmoji(msg.content);
             // photos, videos, GIFs and emoji-only messages go without a bubble
@@ -1319,6 +1424,13 @@ export default function ChatPage() {
                               <span className="break-words text-xs opacity-75 line-clamp-2">{replySnippet(msg.reply_to)}</span>
                             </button>
                           )}
+                          {msg.view_once && (
+                            <ViewOnceBubble
+                              kind={msg.attachments[0] && isVideo(msg.attachments[0]) ? "Video" : "Photo"}
+                              state={viewOnceState(msg, isOwn, user.id)}
+                              onOpen={() => openOnce(msg)}
+                            />
+                          )}
                           {hasAttachments && <AttachmentGrid attachments={media} onOpen={(i) => openLightbox(msg, i)} />}
                           {bigEmoji ? (
                             <p className="text-[44px] leading-tight">{msg.content}</p>
@@ -1370,7 +1482,7 @@ export default function ChatPage() {
                             >
                               <ReplyIcon className="w-4 h-4" />
                             </button>
-                            {isOwn && (
+                            {isOwn && !msg.view_once && (
                               <button
                                 type="button"
                                 onClick={() => startEdit(msg)}
@@ -1440,6 +1552,17 @@ export default function ChatPage() {
                         </button>
                       )}
 
+                      {isOwn && msg.view_once && confirmed && (
+                        <button
+                          type="button"
+                          onClick={() => (msg.opens ?? []).some((o) => o.user_id !== user.id) && setOpenersFor(msg.id)}
+                          className="mx-3 mt-0.5 text-[11px]"
+                          style={{ color: look.muted }}
+                        >
+                          {openersLabel(msg)}
+                        </button>
+                      )}
+
                       {msg.status === "failed" && (
                         <button
                           onClick={() => handleRetry(msg)}
@@ -1449,7 +1572,7 @@ export default function ChatPage() {
                         </button>
                       )}
 
-                      {msg === lastOwnSent && lastOwnSeenBy.length > 0 && (
+                      {msg === lastOwnSent && !msg.view_once && lastOwnSeenBy.length > 0 && (
                         <span className="mx-3 mt-1 text-[11px]" style={{ color: look.muted }}>
                           {otherMembers.length === 1
                             ? "Seen"
@@ -1554,6 +1677,28 @@ export default function ChatPage() {
               </div>
             )}
             <PendingUploads uploads={composer.uploads} onRemove={composer.remove} />
+            {composer.uploads.length > 0 && !editing && (
+              <div className="flex items-center gap-2 px-4 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setViewOnce((v) => !v)}
+                  aria-pressed={viewOnce}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition ${
+                    viewOnce
+                      ? "border-violet-500 bg-violet-600 text-white"
+                      : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
+                  }`}
+                >
+                  <ViewOnceIcon className="w-4 h-4" />
+                  View once
+                </button>
+                {viewOnce && (
+                  <span className="text-[11px] text-neutral-500">
+                    {composer.uploads.length > 1 ? "Each one can" : "It can"} be opened once by each person
+                  </span>
+                )}
+              </div>
+            )}
             <div className="px-3 pt-2 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
               <input
                 ref={fileInputRef}
@@ -1569,16 +1714,15 @@ export default function ChatPage() {
               <div className="flex items-center gap-0.5 rounded-full border border-neutral-800 bg-neutral-900 p-1 transition focus-within:border-neutral-700">
                 <button
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={!!editing}
+                  onClick={() => setCameraOpen(true)}
+                  disabled={!!editing || connState !== "open"}
                   className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 active:scale-95 disabled:opacity-40 disabled:pointer-events-none"
-                  aria-label="Add photos or videos"
-                  title="Add photos or videos (or paste / drop them)"
+                  aria-label="Camera"
+                  title="Take a photo"
                 >
-                  <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={2} />
-                    <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={2} />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 15l-5-5L5 20" />
+                  <svg className="w-[19px] h-[19px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8.5A2.5 2.5 0 016.5 6h1.2l1.3-2h6l1.3 2h1.2A2.5 2.5 0 0120 8.5v9a2.5 2.5 0 01-2.5 2.5h-11A2.5 2.5 0 014 17.5v-9z" />
+                    <circle cx="12" cy="13" r="3.5" strokeWidth={2} />
                   </svg>
                 </button>
                 <input
@@ -1599,7 +1743,7 @@ export default function ChatPage() {
                     }
                     // ↑ in an empty box edits your last message, as in most desktop chat apps
                     if (e.key === "ArrowUp" && !editing && input === "") {
-                      const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status);
+                      const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status && !m.view_once);
                       if (lastOwn) {
                         e.preventDefault();
                         startEdit(lastOwn);
@@ -1615,6 +1759,20 @@ export default function ChatPage() {
                   enterKeyHint="send"
                   className="flex-1 min-w-0 bg-transparent px-2 py-1.5 text-[15px] sm:text-sm text-white placeholder-neutral-500 focus:outline-none disabled:opacity-50"
                 />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!!editing}
+                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+                  aria-label="Add photos or videos"
+                  title="Add photos or videos (or paste / drop them)"
+                >
+                  <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <rect x="3" y="4" width="18" height="16" rx="2.5" strokeWidth={1.8} />
+                    <circle cx="8.5" cy="9.5" r="1.5" strokeWidth={1.8} />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M21 15l-5-5L5 20" />
+                  </svg>
+                </button>
                 <button
                   type="button"
                   data-composer-panel
@@ -1715,7 +1873,9 @@ export default function ChatPage() {
           ...(msg.content
             ? [{ label: "Copy", icon: <CopyIcon className="w-5 h-5" />, onSelect: () => copyText(msg.content) }]
             : []),
-          ...(isOwn ? [{ label: "Edit", icon: <EditIcon className="w-5 h-5" />, onSelect: () => startEdit(msg) }] : []),
+          ...(isOwn && !msg.view_once
+            ? [{ label: "Edit", icon: <EditIcon className="w-5 h-5" />, onSelect: () => startEdit(msg) }]
+            : []),
           ...(msg.edited_at
             ? [{ label: "Edit history", icon: <HistoryIcon className="w-5 h-5" />, onSelect: () => openHistory(msg) }]
             : []),
@@ -1753,6 +1913,24 @@ export default function ChatPage() {
             onClose={closeReactions}
           />
         );
+      })()}
+
+      {cameraOpen && <Camera onSend={sendPhoto} onPickFromLibrary={pickFromLibrary} onClose={closeCamera} />}
+
+      {viewing && (
+        <ViewOnceViewer
+          attachment={viewing.attachment}
+          sender={senderOf(viewing.msg)}
+          sentAt={viewing.msg.sent_at}
+          onClose={closeViewer}
+        />
+      )}
+
+      {openersFor && (() => {
+        const msg = messages.find((m) => m.id === openersFor);
+        const opens = (msg?.opens ?? []).filter((o) => o.user_id !== user.id);
+        if (opens.length === 0) return null;
+        return <OpenersSheet opens={opens} personOf={personOf} onClose={closeOpeners} />;
       })()}
 
       {toast && (

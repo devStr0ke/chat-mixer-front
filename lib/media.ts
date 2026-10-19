@@ -25,8 +25,9 @@ export function formatDuration(ms: number): string {
 }
 
 /** One-line stand-in for a message without text: "📷 Photo", "🎬 2 videos", "GIF"… */
-export function mediaSummary(count: number, videos: number, hasGif: boolean): string {
+export function mediaSummary(count: number, videos: number, hasGif: boolean, viewOnce = false): string {
   if (hasGif) return "GIF";
+  if (viewOnce) return videos > 0 ? "🎬 View-once video" : "📷 View-once photo";
   const photos = count - videos;
   if (videos === 0) return photos > 1 ? `📷 ${photos} photos` : photos === 1 ? "📷 Photo" : "";
   if (photos === 0) return videos > 1 ? `🎬 ${videos} videos` : "🎬 Video";

@@ -161,6 +161,7 @@ export interface LastMessage {
   /** how many of the attachments are videos */
   video_count: number;
   has_gif: boolean;
+  view_once: boolean;
   sent_at: string;
 }
 
@@ -249,6 +250,22 @@ export interface Message {
   reply_to: ReplyPreview | null;
   /** set once the sender has edited the text */
   edited_at: string | null;
+  /** a photo or video each member can open once */
+  view_once?: boolean;
+  /** view-once: who opened it so far (missing until someone does) */
+  opens?: MessageOpen[];
+  /** view-once: the file is gone (everyone opened it, or 14 days passed) */
+  expired?: boolean;
+}
+
+export interface MessageOpen {
+  user_id: string;
+  opened_at: string;
+}
+
+/** Opens a view-once message (once). The file can then be fetched for `expires_in` seconds. */
+export function openViewOnce(messageId: string) {
+  return apiFetch<{ attachment: Attachment; expires_in: number }>(`/messages/${messageId}/open`, { method: "POST" });
 }
 
 /** One version of a message's text and when it was written. */
@@ -279,6 +296,7 @@ export interface ReplyPreview {
   /** how many of the attachments are videos */
   video_count: number;
   has_gif: boolean;
+  view_once: boolean;
 }
 
 export interface MessagePage {
@@ -484,6 +502,17 @@ export function attachmentUrl(attachmentId: string) {
   return `${HTTP_BASE}/attachments/${attachmentId}`;
 }
 
+/** Downloads an attachment into memory (a view-once photo is fetched once, then shown from there). */
+export async function fetchAttachmentBlob(attachmentId: string): Promise<Blob> {
+  const token = getToken();
+  const res = await fetch(attachmentUrl(attachmentId), {
+    cache: "no-store",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) throw new Error(res.status === 410 ? "This has expired." : "Couldn't load it.");
+  return res.blob();
+}
+
 /** A video's poster frame (only when the attachment has_poster). */
 export function attachmentPosterUrl(attachmentId: string) {
   return `${HTTP_BASE}/attachments/${attachmentId}/poster`;
@@ -510,6 +539,7 @@ export type WsOutgoing =
       attachment_ids?: string[];
       gif_id?: string;
       reply_to_id?: string;
+      view_once?: boolean;
     }
   | { type: "typing" }
   | { type: "read"; id: string };
@@ -526,8 +556,10 @@ export type WsIncoming =
       attachments?: Attachment[];
       gif?: MessageGif;
       reply_to?: ReplyPreview;
+      view_once?: boolean;
     }
   | { type: "message_edited"; id: string; room_id: string; content: string; edited_at: string }
+  | { type: "message_opened"; id: string; user_id: string; opened_at: string }
   | { type: "message_ack"; id: string; client_id: string; sent_at: string }
   | { type: "message_error"; client_id: string }
   | { type: "typing"; user_id: string; pseudo: string }
@@ -550,6 +582,7 @@ export type WsNotification =
       attachments?: Attachment[];
       gif?: MessageGif;
       reply_to?: ReplyPreview;
+      view_once?: boolean;
     }
   | { type: "message_edited"; id: string; room_id: string; content: string; edited_at: string }
   | { type: "invitation"; room_id: string }

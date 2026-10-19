@@ -119,6 +119,17 @@ export function useAttachmentUploads(roomId: string, onError: (message: string) 
     [roomId, onError, update, objectUrl]
   );
 
+  /** Uploads a photo straight away, outside the composer (the camera's Send). */
+  const uploadNow = useCallback(
+    async (file: File) => {
+      const blob = await prepareImage(file);
+      if (blob.size > MAX_ATTACHMENT_BYTES) throw new Error("Image is too large (max 10 MB).");
+      const attachment = await uploadAttachment(roomId, blob, file.name || "photo.jpg");
+      return { ...attachment, preview_url: objectUrl(blob) };
+    },
+    [roomId, objectUrl]
+  );
+
   const remove = useCallback((key: string) => {
     abortsRef.current.get(key)?.abort();
     const upload = uploadsRef.current.find((u) => u.key === key);
@@ -143,6 +154,7 @@ export function useAttachmentUploads(roomId: string, onError: (message: string) 
   return {
     uploads,
     addFiles,
+    uploadNow,
     remove,
     take,
     /** uploads still in flight or failed: sending waits until they're resolved */

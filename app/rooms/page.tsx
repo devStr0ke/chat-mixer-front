@@ -112,6 +112,7 @@ export default function RoomsPage() {
                     attachment_count: msg.attachments?.length ?? 0,
                     video_count: msg.attachments?.filter(isVideo).length ?? 0,
                     has_gif: !!msg.gif,
+                    view_once: !!msg.view_once,
                     sent_at: msg.sent_at,
                   },
                 };
@@ -204,7 +205,7 @@ export default function RoomsPage() {
         : `No messages yet · ${room.member_count} members`;
     }
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
-    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif)}`;
+    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once)}`;
   }
 
   return (
