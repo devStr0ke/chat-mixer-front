@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { attachmentUrl, fetchAttachmentBlob, type Attachment, type MessageOpen } from "@/lib/api";
+import { attachmentOverlayUrl, attachmentUrl, fetchAttachmentBlob, type Attachment, type MessageOpen } from "@/lib/api";
 import { formatStamp } from "@/lib/format";
 import { isVideo } from "@/lib/media";
 import { Avatar } from "./Avatar";
@@ -127,19 +127,30 @@ export function ViewOnceViewer({
       {error ? (
         <p className="text-sm text-neutral-300">{error}</p>
       ) : video ? (
-        <video
-          src={attachmentUrl(attachment.id)}
-          autoPlay
-          playsInline
-          disablePictureInPicture
-          disableRemotePlayback
-          controlsList="nodownload noplaybackrate noremoteplayback"
-          onTimeUpdate={(e) => setProgress(e.currentTarget.currentTime / (e.currentTarget.duration || 1))}
-          onEnded={onClose}
-          onError={() => setError("Couldn't play it.")}
-          onClick={(e) => (e.currentTarget.paused ? e.currentTarget.play() : e.currentTarget.pause())}
-          className="max-h-full max-w-full"
-        />
+        <div className="relative">
+          <video
+            src={attachmentUrl(attachment.id)}
+            autoPlay
+            playsInline
+            disablePictureInPicture
+            disableRemotePlayback
+            controlsList="nodownload noplaybackrate noremoteplayback"
+            onTimeUpdate={(e) => setProgress(e.currentTarget.currentTime / (e.currentTarget.duration || 1))}
+            onEnded={onClose}
+            onError={() => setError("Couldn't play it.")}
+            onClick={(e) => (e.currentTarget.paused ? e.currentTarget.play() : e.currentTarget.pause())}
+            className="block max-h-dvh max-w-[100vw]"
+          />
+          {attachment.has_overlay && (
+            // eslint-disable-next-line @next/next/no-img-element -- the text and drawings, exactly the video's size
+            <img
+              src={attachmentOverlayUrl(attachment.id)}
+              alt=""
+              draggable={false}
+              className="pointer-events-none absolute inset-0 h-full w-full"
+            />
+          )}
+        </div>
       ) : src ? (
         // eslint-disable-next-line @next/next/no-img-element -- in-memory copy of the photo
         <img src={src} alt="" draggable={false} className="pointer-events-none max-h-full max-w-full object-contain" />

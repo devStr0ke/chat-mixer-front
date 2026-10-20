@@ -213,6 +213,8 @@ export interface Attachment {
   duration_ms?: number;
   /** videos: whether a poster frame was uploaded with it */
   has_poster?: boolean;
+  /** camera videos: text and drawings shown on top (see attachmentOverlayUrl) */
+  has_overlay?: boolean;
 }
 
 /** A GIF (or sticker) from the GIF library, as attached to a message. */
@@ -509,6 +511,8 @@ export type UploadOptions = {
   poster?: Blob | null;
   /** videos: length in milliseconds */
   durationMs?: number;
+  /** camera videos: the text and drawings, a see-through image the video's size */
+  overlay?: Blob | null;
   /** called with the fraction (0–1) of the body sent so far */
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
@@ -524,11 +528,12 @@ export function uploadAttachment(
   roomId: string,
   file: Blob,
   filename: string,
-  { poster, durationMs, onProgress, signal }: UploadOptions = {}
+  { poster, durationMs, overlay, onProgress, signal }: UploadOptions = {}
 ): Promise<Attachment> {
   const form = new FormData();
   form.append("file", file, filename);
   if (poster) form.append("poster", poster, "poster");
+  if (overlay) form.append("overlay", overlay, "overlay");
   if (durationMs) form.append("duration_ms", String(Math.round(durationMs)));
 
   return new Promise((resolve, reject) => {
@@ -573,6 +578,11 @@ export async function fetchAttachmentBlob(attachmentId: string): Promise<Blob> {
   });
   if (!res.ok) throw new Error(res.status === 410 ? "This has expired." : "Couldn't load it.");
   return res.blob();
+}
+
+/** The text and drawings laid over a camera video (only when the attachment has_overlay). */
+export function attachmentOverlayUrl(attachmentId: string) {
+  return `${HTTP_BASE}/attachments/${attachmentId}/overlay`;
 }
 
 /** A video's poster frame (only when the attachment has_poster). */

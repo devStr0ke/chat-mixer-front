@@ -8,6 +8,7 @@ import {
   MAX_VIDEO_BYTES,
   uploadAttachment,
   type Attachment,
+  type UploadOptions,
 } from "./api";
 import { prepareImage } from "./images";
 import { isVideoFile, prepareVideo } from "./media";
@@ -126,12 +127,24 @@ export function useAttachmentUploads(roomId: string, onError: (message: string) 
     [roomId, onError, update, objectUrl]
   );
 
-  /** Uploads a photo straight away, outside the composer (the camera's Send). */
+  /** Uploads a photo or video straight away, outside the composer (the camera's Send). */
   const uploadNow = useCallback(
-    async (file: File) => {
+    async (
+      file: File,
+      { durationMs, poster, overlay, onProgress }: Omit<UploadOptions, "signal"> = {}
+    ) => {
+      if (isVideoFile(file)) {
+        if (file.size > MAX_VIDEO_BYTES) throw new Error("Video is too large (max 100 MB).");
+        const attachment = await uploadAttachment(roomId, file, file.name || "video", { poster, durationMs, overlay, onProgress });
+        return {
+          ...attachment,
+          preview_url: objectUrl(file),
+          ...(poster && { poster_preview_url: objectUrl(poster) }),
+        };
+      }
       const blob = await prepareImage(file);
       if (blob.size > MAX_ATTACHMENT_BYTES) throw new Error("Image is too large (max 10 MB).");
-      const attachment = await uploadAttachment(roomId, blob, file.name || "photo.jpg");
+      const attachment = await uploadAttachment(roomId, blob, file.name || "photo.jpg", { onProgress });
       return { ...attachment, preview_url: objectUrl(blob) };
     },
     [roomId, objectUrl]

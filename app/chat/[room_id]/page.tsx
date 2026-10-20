@@ -50,7 +50,7 @@ import { ReactionBar } from "@/components/ReactionBar";
 import { MessageMenu, type MessageAction } from "@/components/MessageMenu";
 import { ReactionsSheet } from "@/components/ReactionsSheet";
 import { ViewOnceBubble, ViewOnceIcon, ViewOnceViewer, OpenersSheet, type ViewOnceState } from "@/components/ViewOnce";
-import { Camera } from "@/components/Camera";
+import { Camera, type CameraCapture } from "@/components/Camera";
 import { Sheet } from "@/components/Sheet";
 import { StickerMaker } from "@/components/StickerMaker";
 import { DrawPad } from "@/components/DrawPad";
@@ -1086,16 +1086,32 @@ export default function ChatPage() {
     try { await addReaction(messageId, emoji); } catch { applyReactionOptimistically(messageId, existing ?? null); }
   }
 
-  /** The camera's Send: the photo goes out on its own, like a snap. */
-  async function sendPhoto(file: File, once: boolean) {
+  /**
+   * The camera's Send: the photo or video goes out on its own, like a snap,
+   * and is always view once (only the gallery can send something that stays).
+   */
+  async function sendCapture({ file, durationMs, poster, overlay }: CameraCapture) {
     setCameraOpen(false);
-    showToast("Sending…");
+    const reply = takeReply();
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast("Sending…");
+    let percent = 0;
     try {
-      const attachment = await composer.uploadNow(file);
-      sendContent("", [attachment], null, takeReply(), once);
+      const attachment = await composer.uploadNow(file, {
+        durationMs,
+        poster,
+        overlay,
+        onProgress: (fraction) => {
+          const next = Math.floor(fraction * 100);
+          if (next === percent || next >= 100) return;
+          percent = next;
+          setToast(`Sending… ${next}%`);
+        },
+      });
+      sendContent("", [attachment], null, reply, true);
       setToast(null);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : "The photo couldn't be sent.");
+      showToast(err instanceof Error ? err.message : "It couldn't be sent.");
     }
   }
 
@@ -1918,7 +1934,7 @@ export default function ChatPage() {
         );
       })()}
 
-      {cameraOpen && <Camera onSend={sendPhoto} onPickFromLibrary={pickFromLibrary} onClose={closeCamera} />}
+      {cameraOpen && <Camera onSend={sendCapture} onPickFromLibrary={pickFromLibrary} onClose={closeCamera} />}
 
       {stickerSource && <StickerMaker file={stickerSource} onSave={saveSticker} onClose={closeStickerMaker} />}
 
