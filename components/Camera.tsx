@@ -38,6 +38,13 @@ const RECORD_LONG_SIDE = 1280;
 const RECORD_FPS = 30;
 const VIDEO_BITRATE = 2_500_000;
 const POSTER_LONG_SIDE = 960;
+/** sliding up while filming zooms in: this far (or to near the top of the screen) is the maximum */
+const ZOOM_MIN_TRAVEL = 160;
+const ZOOM_TOP_MARGIN = 110;
+/** the camera's own zoom (lens), when the browser offers it: no loss of quality */
+const MAX_LENS_ZOOM = 10;
+/** otherwise the frame is cropped and enlarged */
+const MAX_DIGITAL_ZOOM = 4;
 const RING_RADIUS = 46;
 const RING_LENGTH = 2 * Math.PI * RING_RADIUS;
 const HINT_KEY = "camera.recorded";
@@ -70,22 +77,40 @@ function cameraError(err: unknown): string {
   return "The camera couldn't be started.";
 }
 
-/** Draws the camera frame filling the canvas, mirrored like the preview for selfies. */
-function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, mirrored: boolean) {
+/**
+ * Draws the camera frame filling the canvas, mirrored like the preview for
+ * selfies; a digital zoom keeps only the middle of the frame.
+ */
+function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, mirrored: boolean, zoom = 1) {
   const { videoWidth: vw, videoHeight: vh } = video;
   // while switching cameras there's no frame: the last one stays on the canvas
   if (!vw || !vh || video.readyState < 2) return;
   const { width: w, height: h } = ctx.canvas;
-  const scale = Math.max(w / vw, h / vh);
-  const dw = vw * scale;
-  const dh = vh * scale;
+  const sw = vw / zoom;
+  const sh = vh / zoom;
+  const scale = Math.max(w / sw, h / sh);
+  const dw = sw * scale;
+  const dh = sh * scale;
   ctx.save();
   if (mirrored) {
     ctx.translate(w, 0);
     ctx.scale(-1, 1);
   }
-  ctx.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  ctx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, (w - dw) / 2, (h - dh) / 2, dw, dh);
   ctx.restore();
+}
+
+type LensZoom = { min: number; max: number; base: number };
+
+/** The camera's own zoom range, when the browser lets a page set it (Chrome on Android does). */
+function lensZoomOf(track: MediaStreamTrack | undefined): LensZoom | null {
+  const caps = track?.getCapabilities?.() as { zoom?: { min: number; max: number } } | undefined;
+  const settings = track?.getSettings() as { zoom?: number } | undefined;
+  const range = caps?.zoom;
+  if (!range || !(range.max > range.min)) return null;
+  // zoomed out as far as it goes is often an ultra-wide lens: start from 1× like the camera app
+  const base = Math.min(range.max, Math.max(range.min, settings?.zoom ?? 1, 1));
+  return range.max > base ? { min: range.min, max: range.max, base } : null;
 }
 
 function posterOf(canvas: HTMLCanvasElement): Promise<Blob | null> {
@@ -105,7 +130,7 @@ function readFlag(): boolean {
   }
 }
 
-type Press = { pointerId: number; timer: ReturnType<typeof setTimeout> | null };
+type Press = { pointerId: number; timer: ReturnType<typeof setTimeout> | null; startY: number };
 
 type Recording = {
   recorder: MediaRecorder;
@@ -119,7 +144,7 @@ type Recording = {
 
 /**
  * Snapchat-style camera: tap the shutter for a photo, hold it for a video
- * (up to a minute). A selfie comes out exactly as it looked on screen
+ * (up to a minute; slide up while holding to zoom). A selfie comes out exactly as it looked on screen
  * (mirrored), and the whole camera frame is kept, so nothing is cropped or
  * zoomed. Whatever is sent from here is view once.
  */
@@ -144,6 +169,10 @@ export function Camera({
   const pressRef = useRef<Press | null>(null);
   const recordingRef = useRef<Recording | null>(null);
   const closedRef = useRef(false);
+  const lensRef = useRef<LensZoom | null>(null);
+  const lensQueueRef = useRef<{ busy: boolean; next: number | null }>({ busy: false, next: null });
+  const digitalZoomRef = useRef(1);
+  const zoomLabelRef = useRef<HTMLSpanElement>(null);
   const [facing, setFacing] = useState<Facing>("user");
   const [mirrored, setMirrored] = useState(true);
   const [canFlip, setCanFlip] = useState(false);
@@ -181,6 +210,9 @@ export function Camera({
         });
         if (cancelled) return stop(stream);
         streamRef.current = stream;
+        lensRef.current = lensZoomOf(stream.getVideoTracks()[0]);
+        digitalZoomRef.current = 1;
+        if (videoRef.current) videoRef.current.style.transform = "";
         // a laptop webcam reports no facing mode: it faces you, so it's mirrored too
         const mirror = stream.getVideoTracks()[0]?.getSettings().facingMode !== "environment";
         mirroredRef.current = mirror;
@@ -303,7 +335,7 @@ export function Camera({
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    drawFrame(ctx, video, mirroredRef.current);
+    drawFrame(ctx, video, mirroredRef.current, digitalZoomRef.current);
 
     setFlash(true);
     setTimeout(() => setFlash(false), 120);
@@ -340,7 +372,7 @@ export function Camera({
     // video encoders want even sizes
     canvas.width = Math.round((video.videoWidth * scale) / 2) * 2;
     canvas.height = Math.round((video.videoHeight * scale) / 2) * 2;
-    drawFrame(ctx, video, mirroredRef.current);
+    drawFrame(ctx, video, mirroredRef.current, digitalZoomRef.current);
 
     const stream = canvas.captureStream(RECORD_FPS);
     mic?.getAudioTracks().forEach((t) => stream.addTrack(t));
@@ -420,7 +452,7 @@ export function Camera({
       // 120 Hz screens call this twice as often as the video needs frames
       if (now - lastDraw >= 1000 / RECORD_FPS - 4) {
         lastDraw = now;
-        drawFrame(ctx, video, mirroredRef.current);
+        drawFrame(ctx, video, mirroredRef.current, digitalZoomRef.current);
       }
       const elapsed = now - rec.startedAt;
       // progress and timer are written straight to the DOM: no re-render per frame
@@ -450,6 +482,53 @@ export function Camera({
     rec.durationMs = performance.now() - rec.startedAt;
     if (rec.recorder.state !== "inactive") rec.recorder.stop();
     setRecording(false);
+    setZoom(1);
+  }
+
+  /** The largest zoom the slide reaches: the lens's own, or a digital one. */
+  function maxZoom() {
+    const lens = lensRef.current;
+    return lens ? Math.min(MAX_LENS_ZOOM, lens.max / lens.base) : MAX_DIGITAL_ZOOM;
+  }
+
+  /** Zooms the camera (1 = none): the lens when possible, otherwise by cropping the frame. */
+  function setZoom(zoom: number) {
+    const lens = lensRef.current;
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (lens && track) {
+      queueLensZoom(track, Math.min(lens.max, Math.max(lens.min, lens.base * zoom)));
+    } else {
+      digitalZoomRef.current = zoom;
+      // the preview is enlarged the same way the recording is cropped
+      if (videoRef.current) videoRef.current.style.transform = zoom > 1 ? `scale(${zoom})` : "";
+    }
+    const label = zoomLabelRef.current;
+    if (label) {
+      label.textContent = `${zoom.toFixed(1)}×`;
+      label.style.opacity = zoom >= 1.05 ? "1" : "0";
+    }
+  }
+
+  // one change at a time, always the latest one: a slide sends many
+  function queueLensZoom(track: MediaStreamTrack, value: number) {
+    const queue = lensQueueRef.current;
+    queue.next = value;
+    if (queue.busy) return;
+    queue.busy = true;
+    void (async () => {
+      while (queue.next !== null) {
+        const next = queue.next;
+        queue.next = null;
+        try {
+          await track.applyConstraints({ advanced: [{ zoom: next } as MediaTrackConstraintSet] });
+        } catch {
+          // the browser refused after all: fall back to the digital zoom
+          lensRef.current = null;
+          queue.next = null;
+        }
+      }
+      queue.busy = false;
+    })();
   }
 
   // leaving the app mid-video ends it (the camera freezes in the background anyway)
@@ -471,7 +550,7 @@ export function Camera({
     } catch {
       /* the release is still caught on the button */
     }
-    const press: Press = { pointerId: e.pointerId, timer: null };
+    const press: Press = { pointerId: e.pointerId, timer: null, startY: e.clientY };
     pressRef.current = press;
     if (canRecord) {
       press.timer = setTimeout(() => {
@@ -479,6 +558,16 @@ export function Camera({
         void startRecording(press);
       }, HOLD_MS);
     }
+  }
+
+  // while filming, sliding the finger up zooms in and bringing it back down zooms out, as in Snapchat
+  function handleShutterMove(e: React.PointerEvent<HTMLButtonElement>) {
+    const press = pressRef.current;
+    if (!press || press.pointerId !== e.pointerId || press.timer) return;
+    const travel = Math.max(ZOOM_MIN_TRAVEL, press.startY - ZOOM_TOP_MARGIN);
+    const t = Math.min(1, Math.max(0, (press.startY - e.clientY) / travel));
+    // exponential, so each bit of the slide feels like the same step
+    setZoom(maxZoom() ** t);
   }
 
   function handleShutterUp(e: React.PointerEvent<HTMLButtonElement>, cancelled = false) {
@@ -492,6 +581,7 @@ export function Camera({
     }
     // a video keeps what was filmed even when the touch is interrupted
     stopRecording();
+    setZoom(1);
   }
 
   // double-tap the preview to switch cameras, as in Snapchat (works while filming too)
@@ -708,6 +798,15 @@ export function Camera({
               )}
               <div className="relative flex h-24 w-24 items-center justify-center">
                 {recording && (
+                  <span
+                    ref={zoomLabelRef}
+                    className="pointer-events-none absolute -top-9 left-1/2 -translate-x-1/2 rounded-full bg-black/50 px-2.5 py-1 text-xs font-semibold tabular-nums text-white opacity-0 backdrop-blur-sm transition-opacity"
+                    aria-hidden
+                  >
+                    1.0×
+                  </span>
+                )}
+                {recording && (
                   <svg className="pointer-events-none absolute inset-0 -rotate-90" viewBox="0 0 100 100" aria-hidden>
                     <circle cx="50" cy="50" r={RING_RADIUS} fill="none" stroke="rgb(255 255 255 / 0.25)" strokeWidth="5" />
                     <circle
@@ -727,6 +826,7 @@ export function Camera({
                 <button
                   type="button"
                   onPointerDown={handleShutterDown}
+                  onPointerMove={handleShutterMove}
                   onPointerUp={(e) => handleShutterUp(e)}
                   onPointerCancel={(e) => handleShutterUp(e, true)}
                   onContextMenu={(e) => e.preventDefault()}
