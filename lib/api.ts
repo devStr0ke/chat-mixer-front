@@ -494,6 +494,23 @@ export function getLinkPreview(url: string): Promise<LinkPreview | null> {
   return pending;
 }
 
+const videoLinkCache = new Map<string, Promise<string | null>>();
+
+/** The full address behind a short TikTok or Instagram share link, or null. */
+export function resolveVideoLink(url: string): Promise<string | null> {
+  let pending = videoLinkCache.get(url);
+  if (!pending) {
+    pending = apiFetch<{ url: string }>(`/link-embed?url=${encodeURIComponent(url)}`)
+      .then((r) => r.url)
+      .catch(() => {
+        videoLinkCache.delete(url);
+        return null;
+      });
+    videoLinkCache.set(url, pending);
+  }
+  return pending;
+}
+
 /** Our own copy of the page's preview image (same-origin, so the auth cookie goes along). */
 export function linkPreviewImageUrl(imageId: string) {
   return `${HTTP_BASE}/link-previews/images/${imageId}`;

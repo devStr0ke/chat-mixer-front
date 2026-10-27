@@ -2,10 +2,28 @@
 
 import { useEffect, useLayoutEffect, useState } from "react";
 import { getLinkPreview, linkPreviewImageUrl, type LinkPreview } from "@/lib/api";
+import { playLinkInApp, playsInApp } from "@/lib/embeds";
+
+function PlayBadge({ small = false }: { small?: boolean }) {
+  return (
+    <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+      <span
+        className={`flex items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-sm ${
+          small ? "h-6 w-6" : "h-12 w-12"
+        }`}
+      >
+        <svg className={small ? "ml-0.5 h-3 w-3" : "ml-1 h-6 w-6"} fill="currentColor" viewBox="0 0 24 24" aria-hidden>
+          <path d="M8 5.5v13a1 1 0 001.5.86l11-6.5a1 1 0 000-1.72l-11-6.5A1 1 0 008 5.5z" />
+        </svg>
+      </span>
+    </span>
+  );
+}
 
 /**
  * Card for a link in a message: site, title, description and image. Renders
- * nothing until (and unless) the page turns out to have a preview.
+ * nothing until (and unless) the page turns out to have a preview. YouTube,
+ * TikTok and Instagram videos get a play button and play in the app.
  * `onShown` lets the conversation re-pin its scroll once the card takes space.
  */
 export function LinkPreviewCard({ url, onShown }: { url: string; onShown?: () => void }) {
@@ -32,34 +50,48 @@ export function LinkPreviewCard({ url, onShown }: { url: string; onShown?: () =>
 
   // wide pictures become a banner; icons and avatars sit beside the text
   const banner = preview.image_id !== null && preview.image_width >= 300 && preview.image_width >= preview.image_height * 1.2;
+  const video = playsInApp(url);
 
   return (
     <a
       href={url}
       target="_blank"
       rel="noopener noreferrer nofollow"
+      onClick={(e) => playLinkInApp(e, url)}
       className="mt-2 block w-64 max-w-full overflow-hidden rounded-xl bg-black/15 text-left transition hover:bg-black/25"
     >
       {banner && (
-        // eslint-disable-next-line @next/next/no-img-element -- authenticated, same-origin images
-        <img
-          src={linkPreviewImageUrl(preview.image_id!)}
-          alt=""
-          loading="lazy"
-          draggable={false}
-          className="aspect-[1.91/1] w-full object-cover"
-        />
-      )}
-      <span className="flex items-start gap-2.5 px-3 py-2">
-        {!banner && preview.image_id && (
-          // eslint-disable-next-line @next/next/no-img-element -- authenticated, same-origin images
+        <span className="relative block">
+          {/* eslint-disable-next-line @next/next/no-img-element -- authenticated, same-origin images */}
           <img
-            src={linkPreviewImageUrl(preview.image_id)}
+            src={linkPreviewImageUrl(preview.image_id!)}
             alt=""
             loading="lazy"
             draggable={false}
-            className="mt-0.5 h-10 w-10 flex-shrink-0 rounded-lg object-cover"
+            className="aspect-[1.91/1] w-full object-cover"
           />
+          {video && <PlayBadge />}
+        </span>
+      )}
+      <span className="flex items-start gap-2.5 px-3 py-2">
+        {!banner && preview.image_id && (
+          <span className="relative mt-0.5 flex-shrink-0">
+            {/* eslint-disable-next-line @next/next/no-img-element -- authenticated, same-origin images */}
+            <img
+              src={linkPreviewImageUrl(preview.image_id)}
+              alt=""
+              loading="lazy"
+              draggable={false}
+              className="h-10 w-10 rounded-lg object-cover"
+            />
+            {video && <PlayBadge small />}
+          </span>
+        )}
+        {/* Instagram hides its pictures from link previews: a video still shows it plays */}
+        {video && !preview.image_id && (
+          <span className="relative mt-0.5 h-10 w-10 flex-shrink-0 rounded-lg bg-black/25">
+            <PlayBadge small />
+          </span>
         )}
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[10px] font-semibold uppercase tracking-wide opacity-70">

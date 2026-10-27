@@ -17,6 +17,7 @@ Chat Mixer is a real-time group chat app. Users register with a pseudo and a cou
 - Make your own stickers: in the Stickers tab, "Create" opens a photo; move and zoom it, cut it out as a circle, a rounded square or freehand (draw around what to keep), with an optional white border. Saved stickers stay in "My stickers" (Edit to remove them)
 - Delete your own messages for everyone (long-press menu or the hover trash button): the room sees "This message was deleted"
 - Links are clickable and shown in a short form, with a preview card (site, title, description, image) when the page provides one
+- YouTube (videos and Shorts), TikTok and Instagram (reels and posts) links play inside the app: tapping the link or its card (which shows a play button) opens the site's own embedded player full screen, and closing it stops the video. Short share links (`vm.tiktok.com/…`, `instagram.com/share/…`) are resolved by the API first. Nothing is loaded from those sites until a link is tapped; private posts, and some reels Instagram or TikTok won't embed, show "Open in …" instead. TikTok starts muted (its player refuses otherwise) and may ask about its cookies inside the player
 - Replies: quote a message (swipe it right on mobile, hover button on desktop); tap the quote to jump to the original
 - Edit your own messages (long-press menu, hover button, or ↑ in an empty message box); an "Edited" label opens the full edit history
 - Room appearance (any member): presets, background color or image, bubble colors, with text contrast picked automatically
