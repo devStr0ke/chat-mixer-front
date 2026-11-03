@@ -127,12 +127,16 @@ export function useAttachmentUploads(roomId: string, onError: (message: string) 
     [roomId, onError, update, objectUrl]
   );
 
-  /** Uploads a photo or video straight away, outside the composer (the camera's Send). */
+  /** Uploads a photo, video or voice message straight away, outside the composer (the camera's Send, the mic). */
   const uploadNow = useCallback(
     async (
       file: File,
-      { durationMs, poster, overlay, onProgress }: Omit<UploadOptions, "signal"> = {}
+      { durationMs, poster, overlay, voice, onProgress }: Omit<UploadOptions, "signal"> = {}
     ) => {
+      if (voice) {
+        const attachment = await uploadAttachment(roomId, file, file.name, { durationMs, voice, onProgress });
+        return { ...attachment, preview_url: objectUrl(file) };
+      }
       if (isVideoFile(file)) {
         if (file.size > MAX_VIDEO_BYTES) throw new Error("Video is too large (max 100 MB).");
         const attachment = await uploadAttachment(roomId, file, file.name || "video", { poster, durationMs, overlay, onProgress });

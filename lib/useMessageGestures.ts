@@ -23,6 +23,8 @@ type Gesture = {
   row: HTMLElement | null;
   // pressed on the bubble itself (long-press and double-tap)
   onBubble: boolean;
+  // pressed on a control in the bubble (a link, the voice player): its taps aren't a double-tap
+  onControl: boolean;
   mode: Mode;
   armed: boolean; // swiped far enough to reply on release
   held: boolean; // the long-press fired
@@ -144,6 +146,7 @@ export function useMessageGestures(
         bubble,
         row,
         onBubble: !!bubble && bubble.contains(target),
+        onControl: !!target.closest("button, a, [data-own-taps]"),
         mode: "pending",
         armed: false,
         held: false,
@@ -210,7 +213,7 @@ export function useMessageGestures(
       if (g.mode === "reply" && g.armed && g.id) handlersRef.current.onSwipeReply(g.id);
       end(g);
 
-      if (tapped && g.onBubble && g.id && g.bubble) {
+      if (tapped && g.onBubble && !g.onControl && g.id && g.bubble) {
         const now = Date.now();
         const last = lastTap.current;
         if (last?.id === g.id && now - last.time < DOUBLE_TAP_MS) {

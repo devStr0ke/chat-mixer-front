@@ -10,6 +10,11 @@ export function isVideo(attachment: { content_type: string }): boolean {
   return attachment.content_type.startsWith("video/");
 }
 
+/** A voice message's recording. */
+export function isAudio(attachment: { content_type: string }): boolean {
+  return attachment.content_type.startsWith("audio/");
+}
+
 /** Some browsers leave the type empty (or use x-m4v), so the extension counts too; the server checks the bytes. */
 export function isVideoFile(file: File): boolean {
   return ACCEPTED_VIDEO_TYPES.includes(file.type) || VIDEO_EXTENSIONS.test(file.name);
@@ -31,8 +36,10 @@ export function mediaSummary(
   hasGif: boolean,
   viewOnce = false,
   sticker = false,
-  drawing = false
+  drawing = false,
+  voice = false
 ): string {
+  if (voice) return "🎤 Voice message";
   if (drawing) return "✏️ Drawing";
   if (sticker) return "Sticker";
   if (hasGif) return "GIF";

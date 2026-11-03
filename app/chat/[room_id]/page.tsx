@@ -37,7 +37,9 @@ import { MembersPanel } from "@/components/MembersPanel";
 import { Avatar } from "@/components/Avatar";
 import { AttachmentGrid, type DisplayAttachment } from "@/components/AttachmentGrid";
 import { Lightbox } from "@/components/Lightbox";
-import { isVideo, isVideoFile, mediaSummary } from "@/lib/media";
+import { isAudio, isVideo, isVideoFile, mediaSummary } from "@/lib/media";
+import { VoiceSession, MIN_VOICE_MS, canRecordVoice, voiceFileName } from "@/lib/voice";
+import { RecordingBar, VoiceMessage } from "@/components/VoiceMessage";
 import { PendingUploads } from "@/components/PendingUploads";
 import { RoomAppearancePanel } from "@/components/RoomAppearancePanel";
 import { EditHistoryDialog } from "@/components/EditHistoryDialog";
@@ -89,6 +91,10 @@ const NEAR_BOTTOM = 120;
 const STAMP_GAP = 30 * 60 * 1000;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_INPUT_HEIGHT = 120; // px: about five lines
+/** sliding the finger this far left off the mic cancels the voice message */
+const SLIDE_TO_CANCEL = 90;
+/** a press on the mic shorter than this is a tap: it records hands-free */
+const TAP_TO_LOCK_MS = 300;
 
 function isStatus(err: unknown, status: number): boolean {
   return (err as { status?: number } | null)?.status === status;
@@ -106,6 +112,7 @@ function replyPreviewOf(msg: ChatMessage): ReplyPreview {
     has_gif: !!msg.gif,
     sticker: !!msg.gif?.sticker || !!msg.sticker,
     drawing: msg.sticker?.kind === "drawing",
+    voice: msg.attachments.some(isAudio),
     view_once: !!msg.view_once,
     deleted: !!msg.deleted,
   };
@@ -116,13 +123,13 @@ function replySnippet(reply: ReplyPreview): string {
   if (reply.deleted) return "Deleted message";
   return (
     reply.content ||
-    mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once, reply.sticker, reply.drawing)
+    mediaSummary(reply.attachment_count, reply.video_count, reply.has_gif, reply.view_once, reply.sticker, reply.drawing, reply.voice)
   );
 }
 
-/** What a message shows as media: its GIF, or its uploaded photos and videos. */
+/** What a message shows as media: its GIF, or its uploaded photos and videos (a voice recording has its own player). */
 function mediaOf(msg: ChatMessage): DisplayAttachment[] {
-  if (!msg.gif) return msg.attachments;
+  if (!msg.gif) return msg.attachments.filter((a) => !isAudio(a));
   const { id, url, width, height } = msg.gif;
   return [{ id: `gif-${id}`, content_type: "image/gif", width, height, size: 0, preview_url: url }];
 }
@@ -199,6 +206,10 @@ export default function ChatPage() {
   // composer: send the picked photos/videos as view-once
   const [viewOnce, setViewOnce] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
+  // a voice message being recorded: holding = the finger is still on the mic
+  const [voice, setVoice] = useState<{ session: VoiceSession; holding: boolean; cancelArmed: boolean } | null>(null);
+  const voiceRef = useRef<VoiceSession | null>(null);
+  const micPressRef = useRef<{ pointerId: number; x: number; at: number; send: boolean; armed: boolean } | null>(null);
   // own message waiting for "delete for everyone" to be confirmed
   const [deleteFor, setDeleteFor] = useState<ChatMessage | null>(null);
   // photo being turned into a sticker
@@ -1086,6 +1097,111 @@ export default function ChatPage() {
     try { await addReaction(messageId, emoji); } catch { applyReactionOptimistically(messageId, existing ?? null); }
   }
 
+  // a recording left behind (room closed) is dropped and the microphone released
+  useEffect(() => () => voiceRef.current?.cancel(), []);
+
+  /** Starts recording a voice message; holding: the finger is on the mic (release sends). */
+  function startVoice(holding: boolean) {
+    if (!canRecordVoice()) {
+      showToast("This browser can't record voice messages.");
+      return false;
+    }
+    const session = new VoiceSession();
+    session.onLimit = () => void sendVoice();
+    voiceRef.current = session;
+    setVoice({ session, holding, cancelArmed: false });
+    setPanel(null);
+    if ("vibrate" in navigator) navigator.vibrate(10);
+    session.start().catch((err: Error) => {
+      if (voiceRef.current === session) {
+        voiceRef.current = null;
+        micPressRef.current = null;
+        setVoice(null);
+      }
+      showToast(err.message);
+    });
+    return true;
+  }
+
+  function cancelVoice() {
+    voiceRef.current?.cancel();
+    voiceRef.current = null;
+    micPressRef.current = null;
+    setVoice(null);
+  }
+
+  /** Stops the recording and sends it on its own, like any message (replies included). */
+  async function sendVoice() {
+    const session = voiceRef.current;
+    if (!session) return;
+    voiceRef.current = null;
+    micPressRef.current = null;
+    setVoice(null);
+    const recording = await session.finish();
+    if (!recording) {
+      showToast("Nothing was recorded. Try again.");
+      return;
+    }
+    if (recording.durationMs < MIN_VOICE_MS) {
+      showToast("Hold to record, let go to send");
+      return;
+    }
+    const reply = takeReply();
+    try {
+      const file = new File([recording.blob], voiceFileName(recording.blob.type), { type: recording.blob.type });
+      const attachment = await composer.uploadNow(file, {
+        durationMs: recording.durationMs,
+        voice: { waveform: recording.waveform },
+      });
+      sendContent("", [attachment], null, reply);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "The voice message couldn't be sent.");
+    }
+  }
+
+  // Instagram's mic: hold to talk and let go to send (slide left to cancel),
+  // or tap it to keep recording hands-free, then tap send
+  function handleMicDown(e: React.PointerEvent<HTMLButtonElement>) {
+    if (e.button !== 0 || micPressRef.current) return;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* the release still lands on the button */
+    }
+    const press = { pointerId: e.pointerId, x: e.clientX, at: performance.now(), send: !!voiceRef.current, armed: false };
+    if (!press.send && !startVoice(true)) return;
+    micPressRef.current = press;
+  }
+
+  function handleMicMove(e: React.PointerEvent<HTMLButtonElement>) {
+    const press = micPressRef.current;
+    if (!press || press.pointerId !== e.pointerId || press.send) return;
+    const armed = press.x - e.clientX > SLIDE_TO_CANCEL;
+    if (armed === press.armed) return;
+    press.armed = armed;
+    setVoice((v) => v && { ...v, cancelArmed: armed });
+  }
+
+  function handleMicUp(e: React.PointerEvent<HTMLButtonElement>, interrupted = false) {
+    const press = micPressRef.current;
+    if (!press || press.pointerId !== e.pointerId) return;
+    micPressRef.current = null;
+    if (press.send) {
+      if (!interrupted) void sendVoice();
+      return;
+    }
+    if (press.armed) {
+      cancelVoice();
+      return;
+    }
+    // a tap (or the permission prompt taking the touch away) keeps recording hands-free
+    if (interrupted || performance.now() - press.at < TAP_TO_LOCK_MS) {
+      setVoice((v) => v && { ...v, holding: false, cancelArmed: false });
+      return;
+    }
+    void sendVoice();
+  }
+
   /**
    * The camera's Send: the photo or video goes out on its own, like a snap,
    * and is always view once (only the gallery can send something that stays).
@@ -1334,6 +1450,8 @@ export default function ChatPage() {
   const typingText = input.trim() !== "";
   // phones: while typing, the buttons make way for the text (they're back once it's empty)
   const typingHides = !!editing || typingText ? "pointer-coarse:hidden" : "";
+  // while recording, the message box shows the recording instead
+  const recordingHides = voice ? "hidden" : "";
   const sendDisabled = editing
     ? savingEdit || (!input.trim() && mediaOf(editing).length === 0)
     : composer.blocked || (!input.trim() && composer.ready === 0);
@@ -1677,7 +1795,15 @@ export default function ChatPage() {
                 }}
               />
               <div className="flex items-end gap-0.5 rounded-[22px] border border-neutral-800 bg-neutral-900 p-1 transition focus-within:border-neutral-700">
-                {typingText && !editing ? (
+                {voice && (
+                  <RecordingBar
+                    session={voice.session}
+                    holding={voice.holding}
+                    cancelArmed={voice.cancelArmed}
+                    onCancel={cancelVoice}
+                  />
+                )}
+                {voice ? null : typingText && !editing ? (
                   <button
                     type="button"
                     data-composer-panel
@@ -1730,7 +1856,9 @@ export default function ChatPage() {
                     }
                     // ↑ in an empty box edits your last message, as in most desktop chat apps
                     if (e.key === "ArrowUp" && !editing && input === "") {
-                      const lastOwn = messages.findLast((m) => m.sender_id === user.id && !m.status && !m.view_once && !m.deleted);
+                      const lastOwn = messages.findLast(
+                        (m) => m.sender_id === user.id && !m.status && !m.view_once && !m.deleted && !m.attachments.some(isAudio)
+                      );
                       if (lastOwn) {
                         e.preventDefault();
                         startEdit(lastOwn);
@@ -1743,14 +1871,50 @@ export default function ChatPage() {
                   // on phones, opening a room shouldn't pop the keyboard up
                   autoFocus={pointerFine}
                   enterKeyHint={pointerFine ? "send" : "enter"}
-                  className="block flex-1 min-w-0 resize-none overflow-y-auto bg-transparent px-2 py-2 text-[15px] leading-5 sm:text-sm text-white placeholder-neutral-500 placeholder:whitespace-nowrap focus:outline-none disabled:opacity-50"
+                  className={`block flex-1 min-w-0 resize-none overflow-y-auto bg-transparent px-2 py-2 text-[15px] leading-5 sm:text-sm text-white placeholder-neutral-500 placeholder:whitespace-nowrap focus:outline-none disabled:opacity-50 ${recordingHides}`}
                   style={{ maxHeight: MAX_INPUT_HEIGHT }}
                 />
+                {(!hasDraft || voice) && (
+                  <button
+                    type="button"
+                    onPointerDown={handleMicDown}
+                    onPointerMove={handleMicMove}
+                    onPointerUp={(e) => handleMicUp(e)}
+                    onPointerCancel={(e) => handleMicUp(e, true)}
+                    onContextMenu={(e) => e.preventDefault()}
+                    // keyboards (Enter / Space) click with detail 0: start hands-free, then send
+                    onClick={(e) => {
+                      if (e.detail !== 0) return;
+                      if (voiceRef.current) void sendVoice();
+                      else startVoice(false);
+                    }}
+                    className={`flex h-9 w-9 flex-shrink-0 touch-none select-none items-center justify-center rounded-full transition-all duration-150 [-webkit-touch-callout:none] ${
+                      !voice
+                        ? "text-neutral-400 hover:text-white"
+                        : voice.holding
+                          ? `scale-125 text-white ${voice.cancelArmed ? "bg-red-500" : "bg-violet-600"}`
+                          : "bg-violet-600 text-white hover:bg-violet-500 active:scale-95"
+                    }`}
+                    aria-label={!voice ? "Record a voice message" : voice.holding ? "Recording: let go to send" : "Send voice message"}
+                    title={!voice ? "Hold to record a voice message, or tap to record hands-free" : undefined}
+                  >
+                    {voice && !voice.holding ? (
+                      <svg className="h-[18px] w-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.4} d="M5 12h14M13 6l6 6-6 6" />
+                      </svg>
+                    ) : (
+                      <svg className="h-[22px] w-[22px]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                        <rect x="9" y="3" width="6" height="11" rx="3" strokeWidth={1.8} />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M5.5 11a6.5 6.5 0 0013 0M12 17.5V21" />
+                      </svg>
+                    )}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   disabled={!!editing}
-                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${typingHides}`}
+                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${typingHides} ${recordingHides}`}
                   aria-label="Add photos or videos"
                   title="Add photos or videos (or paste / drop them)"
                 >
@@ -1768,7 +1932,7 @@ export default function ChatPage() {
                       setDrawing(true);
                     }}
                     disabled={!!editing}
-                    className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+                    className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-neutral-400 transition hover:text-white disabled:opacity-40 disabled:pointer-events-none ${recordingHides}`}
                     aria-label="Draw"
                     title="Draw and send it"
                   >
@@ -1783,9 +1947,9 @@ export default function ChatPage() {
                   data-composer-panel
                   onClick={() => setPanel((p) => (p === "emoji" ? null : "emoji"))}
                   // phones have emojis on their keyboard
-                  className={`hidden pointer-fine:flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white ${
-                    panel === "emoji" ? "text-white" : "text-neutral-400"
-                  }`}
+                  className={`hidden h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:text-white ${
+                    voice ? "" : "pointer-fine:flex"
+                  } ${panel === "emoji" ? "text-white" : "text-neutral-400"}`}
                   aria-label="Emoji"
                   aria-expanded={panel === "emoji"}
                   title="Emoji"
@@ -1795,7 +1959,7 @@ export default function ChatPage() {
                     <path strokeLinecap="round" strokeWidth={1.8} d="M8.5 14.5s1.25 1.5 3.5 1.5 3.5-1.5 3.5-1.5M9 9.5h.01M15 9.5h.01" />
                   </svg>
                 </button>
-                {hasDraft ? (
+                {voice ? null : hasDraft ? (
                   <button
                     type="submit"
                     disabled={sendDisabled}
@@ -1879,7 +2043,7 @@ export default function ChatPage() {
           ...(msg.content
             ? [{ label: "Copy", icon: <CopyIcon className="w-5 h-5" />, onSelect: () => copyText(msg.content) }]
             : []),
-          ...(isOwn && !msg.view_once && !msg.gif?.sticker && !msg.sticker
+          ...(isOwn && !msg.view_once && !msg.gif?.sticker && !msg.sticker && !msg.attachments.some(isAudio)
             ? [{ label: "Edit", icon: <EditIcon className="w-5 h-5" />, onSelect: () => startEdit(msg) }]
             : []),
           ...(msg.edited_at
@@ -2155,6 +2319,7 @@ const MessageListView = memo(function MessageListView({
       // a view-once photo is never shown in the conversation; a sticker goes without a frame
       const media = msg.view_once || sticker ? [] : mediaOf(msg);
       const hasAttachments = media.length > 0;
+      const voiceClip = msg.view_once || deleted ? undefined : msg.attachments.find(isAudio);
       const bigEmoji = !hasAttachments && !msg.reply_to && isBigEmoji(msg.content);
       // photos, videos, GIFs, stickers and emoji-only messages go without a bubble
       const bare = !deleted && (bigEmoji || sticker || (hasAttachments && !msg.content && !msg.reply_to));
@@ -2304,6 +2469,7 @@ const MessageListView = memo(function MessageListView({
                         onOpen={() => actions.current?.openOnce(msg)}
                       />
                     )}
+                    {voiceClip && <VoiceMessage attachment={voiceClip} />}
                     {hasAttachments && <AttachmentGrid attachments={media} onOpen={(i) => actions.current?.openLightbox(msg, i)} />}
                     {bigEmoji ? (
                       <p className="text-[44px] leading-tight">{msg.content}</p>
@@ -2357,7 +2523,7 @@ const MessageListView = memo(function MessageListView({
                       >
                         <ReplyIcon className="w-4 h-4" />
                       </button>
-                      {isOwn && !msg.view_once && !sticker && (
+                      {isOwn && !msg.view_once && !sticker && !voiceClip && (
                         <button
                           type="button"
                           onClick={() => actions.current?.startEdit(msg)}

@@ -18,7 +18,7 @@ import Link from "next/link";
 import { Avatar } from "@/components/Avatar";
 import { UserFlags } from "@/components/UserFlags";
 import { CreateRoomDialog } from "@/components/CreateRoomDialog";
-import { isVideo, mediaSummary } from "@/lib/media";
+import { isAudio, isVideo, mediaSummary } from "@/lib/media";
 
 export default function RoomsPage() {
   const router = useRouter();
@@ -127,6 +127,7 @@ export default function RoomsPage() {
                     has_gif: !!msg.gif,
                     sticker: !!msg.gif?.sticker || !!msg.sticker,
                     drawing: msg.sticker?.kind === "drawing",
+                    voice: msg.attachments?.some(isAudio) ?? false,
                     view_once: !!msg.view_once,
                     deleted: false,
                     sent_at: msg.sent_at,
@@ -259,7 +260,7 @@ export default function RoomsPage() {
     }
     const who = last.sender_id === user?.id ? "You" : last.sender_pseudo;
     if (last.deleted) return last.sender_id === user?.id ? "You deleted a message" : `${who} deleted a message`;
-    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once, last.sticker, last.drawing)}`;
+    return `${who}: ${last.content || mediaSummary(last.attachment_count, last.video_count, last.has_gif, last.view_once, last.sticker, last.drawing, last.voice)}`;
   }
 
   return (

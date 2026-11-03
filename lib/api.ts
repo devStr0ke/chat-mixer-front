@@ -165,6 +165,8 @@ export interface LastMessage {
   sticker: boolean;
   /** a drawing made in the chat */
   drawing: boolean;
+  /** a voice message */
+  voice?: boolean;
   view_once: boolean;
   /** deleted by its sender */
   deleted: boolean;
@@ -215,6 +217,8 @@ export interface Attachment {
   has_poster?: boolean;
   /** camera videos: text and drawings shown on top (see attachmentOverlayUrl) */
   has_overlay?: boolean;
+  /** voice messages: bar heights (0–100) for the waveform */
+  waveform?: number[];
 }
 
 /** A GIF (or sticker) from the GIF library, as attached to a message. */
@@ -358,6 +362,8 @@ export interface ReplyPreview {
   has_gif: boolean;
   sticker: boolean;
   drawing: boolean;
+  /** a voice message */
+  voice?: boolean;
   view_once: boolean;
   /** the quoted message was deleted by its sender */
   deleted: boolean;
@@ -530,6 +536,8 @@ export type UploadOptions = {
   durationMs?: number;
   /** camera videos: the text and drawings, a see-through image the video's size */
   overlay?: Blob | null;
+  /** voice messages: sent as such (the server can't tell them from videos), with their waveform */
+  voice?: { waveform: number[] };
   /** called with the fraction (0–1) of the body sent so far */
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
@@ -545,12 +553,16 @@ export function uploadAttachment(
   roomId: string,
   file: Blob,
   filename: string,
-  { poster, durationMs, overlay, onProgress, signal }: UploadOptions = {}
+  { poster, durationMs, overlay, voice, onProgress, signal }: UploadOptions = {}
 ): Promise<Attachment> {
   const form = new FormData();
   form.append("file", file, filename);
   if (poster) form.append("poster", poster, "poster");
   if (overlay) form.append("overlay", overlay, "overlay");
+  if (voice) {
+    form.append("kind", "voice");
+    form.append("waveform", voice.waveform.join(","));
+  }
   if (durationMs) form.append("duration_ms", String(Math.round(durationMs)));
 
   return new Promise((resolve, reject) => {
